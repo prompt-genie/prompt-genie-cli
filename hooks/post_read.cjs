@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
-const CACHE_FILE = path.join(process.env.HOME, ".claude/pg_read_cache.json");
-const STATS_FILE = path.join(process.env.HOME, ".claude/pg_stats.json");
+const CACHE_FILE   = path.join(process.env.HOME, ".claude/pg_read_cache.json");
+const STATS_FILE   = path.join(process.env.HOME, ".claude/pg_stats.json");
 const SESSION_FILE = path.join(process.env.HOME, ".claude/pg_session.json");
 
 function loadJson(file) {
@@ -12,6 +13,10 @@ function loadJson(file) {
 
 function saveJson(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2));
+}
+
+function hashContent(str) {
+  try { return crypto.createHash("sha1").update(str).digest("hex"); } catch { return null; }
 }
 
 function recordMiss() {
@@ -25,6 +30,7 @@ function recordMiss() {
   saveJson(SESSION_FILE, session);
 }
 
+process.stdin.resume();
 let raw = "";
 process.stdin.on("data", (chunk) => (raw += chunk));
 process.stdin.on("end", () => {
@@ -48,8 +54,9 @@ process.stdin.on("end", () => {
   let mtime;
   try { mtime = fs.statSync(filePath).mtimeMs; } catch { process.exit(0); }
 
+  const hash = hashContent(content);
   const cache = loadJson(CACHE_FILE);
-  cache[filePath] = { mtime, content };
+  cache[filePath] = { mtime, hash, content };
   saveJson(CACHE_FILE, cache);
   recordMiss();
 

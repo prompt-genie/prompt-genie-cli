@@ -30,23 +30,23 @@ function estimateTokens(text) {
   return Math.max(1, Math.floor(text.length / 4));
 }
 
-// Returns decoded payload or null if invalid/expired
+function hashFile(filePath) {
+  try {
+    return crypto.createHash("sha1").update(fs.readFileSync(filePath)).digest("hex");
+  } catch { return null; }
+}
+
 function verifyJWT(token) {
   try {
     const [header, payload, signature] = token.split(".");
     if (!header || !payload || !signature) return null;
-
     const verify = crypto.createVerify("RSA-SHA256");
     verify.update(`${header}.${payload}`);
-    const valid = verify.verify(PUBLIC_KEY, signature, "base64url");
-    if (!valid) return null;
-
+    if (!verify.verify(PUBLIC_KEY, signature, "base64url")) return null;
     const decoded = JSON.parse(Buffer.from(payload, "base64url").toString());
-    if (decoded.exp < Math.floor(Date.now() / 1000)) return null; // expired
+    if (decoded.exp < Math.floor(Date.now() / 1000)) return null;
     return decoded;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
 function isPaidPlan(plan) {
@@ -70,6 +70,7 @@ function recordHit(filePath, tokensSaved) {
   saveJson(SESSION_FILE, session);
 }
 
+process.stdin.resume();
 let raw = "";
 process.stdin.on("data", (chunk) => (raw += chunk));
 process.stdin.on("end", () => {
@@ -78,7 +79,6 @@ process.stdin.on("end", () => {
 
   if (data.tool_name !== "Read") process.exit(0);
 
-  // Check JWT — gate cache on paid plan
   const config = loadJson(CONFIG_FILE);
   const token = config.token;
   if (!token) process.exit(0);
@@ -89,17 +89,33 @@ process.stdin.on("end", () => {
   const filePath = data.tool_input?.file_path;
   if (!filePath || !fs.existsSync(filePath)) process.exit(0);
 
+  const cache = loadJson(CACHE_FILE);
+  const entry = cache[filePath];
+  if (!entry) process.exit(0);
+
+  // Fast path: mtime unchanged, no need to hash
   let mtime;
   try { mtime = fs.statSync(filePath).mtimeMs; } catch { process.exit(0); }
 
-  const cache = loadJson(CACHE_FILE);
-  const entry = cache[filePath];
-
-  if (entry && entry.mtime === mtime) {
+  if (entry.mtime === mtime) {
     const tokensSaved = estimateTokens(entry.content);
     recordHit(filePath, tokensSaved);
     process.stdout.write(entry.content);
     process.exit(2);
+  }
+
+  // mtime changed — check content hash before giving up
+  if (entry.hash) {
+    const currentHash = hashFile(filePath);
+    if (currentHash && currentHash === entry.hash) {
+      // File touched but content identical — update mtime in cache and serve
+      cache[filePath].mtime = mtime;
+      saveJson(CACHE_FILE, cache);
+      const tokensSaved = estimateTokens(entry.content);
+      recordHit(filePath, tokensSaved);
+      process.stdout.write(entry.content);
+      process.exit(2);
+    }
   }
 
   process.exit(0);

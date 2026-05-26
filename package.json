@@ -1,23 +1,32 @@
 {
   "name": "prompt-genie",
-  "version": "0.2.0",
-  "description": "Save tokens in Claude Code by caching file reads",
+  "version": "0.3.4",
+  "description": "Cut your Claude Code costs. Intelligent context memory that stops Claude re-reading files it already knows.",
   "bin": {
     "prompt-genie": "./bin/install.cjs"
   },
   "files": [
     "bin",
-    "hooks"
+    "dist"
   ],
+  "scripts": {
+    "build": "node scripts/build.js",
+    "prepublishOnly": "npm run build"
+  },
   "keywords": [
     "claude",
     "claude-code",
-    "tokens",
+    "context",
     "ai",
+    "cost-savings",
+    "tokens",
     "prompt"
   ],
   "license": "MIT",
   "engines": {
     "node": ">=16"
+  },
+  "devDependencies": {
+    "javascript-obfuscator": "^5.4.3"
   }
 }

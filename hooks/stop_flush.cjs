@@ -94,13 +94,32 @@ async function refreshToken(oldToken) {
   return null;
 }
 
+async function readStdin() {
+  return new Promise((resolve) => {
+    let raw = "";
+    process.stdin.resume();
+    process.stdin.on("data", (c) => (raw += c));
+    process.stdin.on("end", () => {
+      try { resolve(JSON.parse(raw)); } catch { resolve({}); }
+    });
+    // Don't hang if stdin closes immediately
+    setTimeout(() => resolve({}), 500);
+  });
+}
+
 async function main() {
+  const event = await readStdin();
+
   const session = loadJson(SESSION_FILE);
   const config = loadJson(CONFIG_FILE);
 
   const hits = session.hits || 0;
   const misses = session.misses || 0;
   const tokensSaved = session.tokensSaved || 0;
+
+  // Capture codebase (project folder name) and model from the stop event
+  const codebase = path.basename(process.cwd());
+  const model = event.model || event.claude_model || process.env.CLAUDE_MODEL || null;
 
   if (hits === 0 && misses === 0) process.exit(0);
 
@@ -112,7 +131,7 @@ async function main() {
   let plan = jwt?.plan;
 
   if (!jwt) {
-    // Token invalid or expired — try refresh
+    // Token invalid or expired, try refresh
     const refreshed = await refreshToken(token);
     if (refreshed) {
       plan = refreshed.plan;
@@ -122,18 +141,19 @@ async function main() {
     }
   }
 
-  // FREE plan — show FOMO, don't write stats
+  // FREE plan: show FOMO, don't write stats
   if (!isPaidPlan(plan)) {
     const savings = tokensSaved.toLocaleString();
     process.stderr.write(
-      `\n💡 Prompt Genie: You would have saved ~${savings} tokens this session.\n` +
-      `   Upgrade to Pro to activate caching → prompt-genie.com\n\n`
+      `\n  Prompt Genie: Context Memory paused\n` +
+      `  Claude re-read ~${savings} tokens worth of context this session.\n` +
+      `  Activate to stop paying for what Claude already knows → prompt-genie.com\n\n`
     );
     fs.writeFileSync(SESSION_FILE, JSON.stringify({}));
     process.exit(0);
   }
 
-  // PRO/TEAMS — write stats
+  // PRO/TEAMS: write stats
   try {
     const decoded = jwt || decodeJWT(token);
     await gqlPost(
@@ -148,6 +168,8 @@ async function main() {
           misses,
           tokensSaved,
           source: "CLAUDE_CODE",
+          codebase,
+          ...(model ? { model } : {}),
           createdAt: new Date().toISOString(),
         },
       }
