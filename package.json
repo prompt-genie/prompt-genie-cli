@@ -1,6 +1,6 @@
 {
   "name": "prompt-genie",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Save tokens in Claude Code by caching file reads",
   "bin": {
     "prompt-genie": "./bin/install.cjs"
@@ -9,7 +9,13 @@
     "bin",
     "hooks"
   ],
-  "keywords": ["claude", "claude-code", "tokens", "ai", "prompt"],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "tokens",
+    "ai",
+    "prompt"
+  ],
   "license": "MIT",
   "engines": {
     "node": ">=16"
