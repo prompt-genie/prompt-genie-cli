@@ -117,9 +117,8 @@ async function main() {
   const misses = session.misses || 0;
   const tokensSaved = session.tokensSaved || 0;
 
-  // Capture codebase (project folder name) and model from the stop event
+  // Capture codebase (project folder name) from cwd
   const codebase = path.basename(process.cwd());
-  const model = event.model || event.claude_model || process.env.CLAUDE_MODEL || null;
 
   if (hits === 0 && misses === 0) process.exit(0);
 
@@ -169,7 +168,6 @@ async function main() {
           tokensSaved,
           source: "CLAUDE_CODE",
           codebase,
-          ...(model ? { model } : {}),
           createdAt: new Date().toISOString(),
         },
       }
