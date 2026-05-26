@@ -67,6 +67,10 @@ function recordHit(filePath, tokensSaved) {
   session.hits = (session.hits || 0) + 1;
   session.tokensSaved = (session.tokensSaved || 0) + tokensSaved;
   session.date = new Date().toISOString().slice(0, 10);
+  // Track files read this session for context-hint injection
+  const files = session.filesRead || [];
+  if (!files.includes(filePath)) files.push(filePath);
+  session.filesRead = files;
   saveJson(SESSION_FILE, session);
 }
 

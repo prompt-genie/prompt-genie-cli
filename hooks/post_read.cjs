@@ -58,6 +58,14 @@ process.stdin.on("end", () => {
   const cache = loadJson(CACHE_FILE);
   cache[filePath] = { mtime, hash, content };
   saveJson(CACHE_FILE, cache);
+
+  // Track files read this session for context-hint injection
+  const session = loadJson(SESSION_FILE);
+  const files = session.filesRead || [];
+  if (!files.includes(filePath)) files.push(filePath);
+  session.filesRead = files;
+  saveJson(SESSION_FILE, session);
+
   recordMiss();
 
   process.exit(0);

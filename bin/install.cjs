@@ -95,6 +95,9 @@ function wireHooks() {
     { matcher: "Read", hooks: [{ type: "command", command: `node ${path.join(HOOKS_DEST, "post_read.cjs")}` }] },
     { matcher: "Bash", hooks: [{ type: "command", command: `node ${path.join(HOOKS_DEST, "post_bash.cjs")}` }] },
   ];
+  settings.hooks.UserPromptSubmit = [
+    { hooks: [{ type: "command", command: `node ${path.join(HOOKS_DEST, "user_prompt_submit.cjs")}` }] },
+  ];
   settings.hooks.Stop = [
     { hooks: [{ type: "command", command: `node ${path.join(HOOKS_DEST, "stop_flush.cjs")}` }] },
   ];
