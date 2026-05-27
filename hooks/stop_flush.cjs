@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+process.on("uncaughtException", (err) => { process.stderr.write("pg stop_flush: " + err.message + "\n"); process.exit(0); });
 const fs = require("fs");
 const path = require("path");
 const https = require("https");

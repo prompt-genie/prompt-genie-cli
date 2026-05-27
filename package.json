@@ -1,6 +1,6 @@
 {
   "name": "prompt-genie",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "description": "Cut your Claude Code costs. Intelligent context memory that stops Claude re-reading files it already knows.",
   "bin": {
     "prompt-genie": "./bin/install.cjs"

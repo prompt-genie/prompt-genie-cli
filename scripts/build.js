@@ -26,7 +26,6 @@ const OBFUSCATOR_OPTIONS = {
   stringArray: true,
   stringArrayEncoding: ["base64"],
   stringArrayThreshold: 0.85,
-  transformObjectKeys: true,
   unicodeEscapeSequence: false,
 };
 
