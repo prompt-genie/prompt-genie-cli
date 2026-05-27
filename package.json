@@ -11,7 +11,8 @@
   ],
   "scripts": {
     "build": "node scripts/build.js",
-    "prepublishOnly": "npm run build"
+    "test": "node scripts/test.js",
+    "prepublishOnly": "npm run build && npm run test"
   },
   "keywords": [
     "claude",
