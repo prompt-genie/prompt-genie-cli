@@ -1,57 +1,11 @@
 #!/usr/bin/env node
 process.on("uncaughtException", (err) => { process.stderr.write("pg stop_flush: " + err.message + "\n"); process.exit(0); });
-const fs = require("fs");
 const path = require("path");
 const https = require("https");
-const crypto = require("crypto");
-
-const SESSION_FILE = path.join(process.env.HOME, ".claude/pg_session.json");
-const CONFIG_FILE  = path.join(process.env.HOME, ".claude/pg_config.json");
+const lib = require("./_lib.cjs");
 
 const GRAPHQL_URL = "https://ouybbvbacjd3tbbvf3jpqbiizy.appsync-api.us-east-2.amazonaws.com/graphql";
 const API_KEY     = "da2-xj6noinlgffx3ms3lgeopbhrjq";
-
-const PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArjBMJfK6K8JnPvZR3kuS
-d80nO2gvF2AULghE6WNtD1N0+k2GPShpGBiV/6WugrP840i8MRL+fyBid7DQw6Tj
-eqZ7lj8wHTKglNZCRgOvmV+Q9LOpUfDCV+znUlEJLlbZy73X2CNPN6D2kfKPL7yT
-Yo9HJG2j2n0BQhrQELbSct1q4hNMwcie2X5S9mR+lwcxRFEsvLuVe33hH0Rk6CSz
-BP0MCcqwkHCs8a5bdm2U5KveIv1pMUwwl8HKki3rjYbv7scdXPgERs27tRbpLdYj
-2+MhWaGHrt21pfASIKPwFiZaMhOV49hT3CC3rRY4zgtExFfYIx8qHt4LDM3rSheM
-dwIDAQAB
------END PUBLIC KEY-----`;
-
-function loadJson(file) {
-  try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return {}; }
-}
-
-function isPaidPlan(plan) {
-  return ["PRO", "ANNUAL_PRO", "THREE_DAY_PASS", "TEAMS", "ENTERPRISE"].includes(plan);
-}
-
-// Returns decoded payload or null if invalid/expired
-function verifyJWT(token) {
-  try {
-    const [header, payload, signature] = token.split(".");
-    if (!header || !payload || !signature) return null;
-
-    const verify = crypto.createVerify("RSA-SHA256");
-    verify.update(`${header}.${payload}`);
-    const valid = verify.verify(PUBLIC_KEY, signature, "base64url");
-    if (!valid) return null;
-
-    return JSON.parse(Buffer.from(payload, "base64url").toString());
-  } catch {
-    return null;
-  }
-}
-
-function decodeJWT(token) {
-  try {
-    const [, payload] = token.split(".");
-    return JSON.parse(Buffer.from(payload, "base64url").toString());
-  } catch { return null; }
-}
 
 function gqlPost(query, variables) {
   return new Promise((resolve, reject) => {
@@ -85,41 +39,35 @@ async function refreshToken(oldToken) {
     );
     const result = JSON.parse(res.data?.cliAuth || "{}");
     if (result.token) {
-      const config = loadJson(CONFIG_FILE);
+      const config = lib.loadJson(lib.CONFIG_FILE);
       config.token = result.token;
       config.plan = result.plan;
-      fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+      lib.saveJsonAtomic(lib.CONFIG_FILE, config);
       return result;
     }
   } catch { /* silent */ }
   return null;
 }
 
-async function readStdin() {
-  return new Promise((resolve) => {
-    let raw = "";
-    process.stdin.resume();
-    process.stdin.on("data", (c) => (raw += c));
-    process.stdin.on("end", () => {
-      try { resolve(JSON.parse(raw)); } catch { resolve({}); }
-    });
-    // Don't hang if stdin closes immediately
-    setTimeout(() => resolve({}), 500);
-  });
-}
-
 async function main() {
-  const event = await readStdin();
+  const event = (await lib.readStdinJson(500)) || {};
+  const sessionId = event.session_id;
 
-  const session = loadJson(SESSION_FILE);
-  const config = loadJson(CONFIG_FILE);
+  // Housekeeping: drop stale per-session files and pre-0.4 global caches
+  lib.gcSessions();
+  lib.unlinkQuiet(path.join(lib.CLAUDE_DIR, "pg_session.json"));
+  lib.unlinkQuiet(path.join(lib.CLAUDE_DIR, "pg_read_cache.json"));
+  lib.unlinkQuiet(path.join(lib.CLAUDE_DIR, "pg_bash_cache.json"));
+
+  const session = lib.loadSession(sessionId);
+  const config = lib.loadJson(lib.CONFIG_FILE);
 
   const hits = session.hits || 0;
   const misses = session.misses || 0;
   const tokensSaved = session.tokensSaved || 0;
 
   // Capture codebase (project folder name) from cwd
-  const codebase = path.basename(process.cwd());
+  const codebase = path.basename(event.cwd || process.cwd());
 
   if (hits === 0 && misses === 0) process.exit(0);
 
@@ -127,7 +75,7 @@ async function main() {
   if (!token) process.exit(0);
 
   // Verify or refresh JWT
-  let jwt = verifyJWT(token);
+  let jwt = lib.verifyJWT(token);
   let plan = jwt?.plan;
 
   if (!jwt) {
@@ -135,27 +83,27 @@ async function main() {
     const refreshed = await refreshToken(token);
     if (refreshed) {
       plan = refreshed.plan;
-      jwt = decodeJWT(refreshed.token);
+      jwt = lib.decodeJWT(refreshed.token);
     } else {
       process.exit(0);
     }
   }
 
   // FREE plan: show FOMO, don't write stats
-  if (!isPaidPlan(plan)) {
+  if (!lib.isPaidPlan(plan)) {
     const savings = tokensSaved.toLocaleString();
     process.stderr.write(
       `\n  Prompt Genie: Context Memory paused\n` +
       `  Claude re-read ~${savings} tokens worth of context this session.\n` +
       `  Activate to stop paying for what Claude already knows → prompt-genie.com\n\n`
     );
-    fs.writeFileSync(SESSION_FILE, JSON.stringify({}));
+    lib.deleteSession(sessionId);
     process.exit(0);
   }
 
   // PRO/TEAMS: write stats
   try {
-    const decoded = jwt || decodeJWT(token);
+    const decoded = jwt || lib.decodeJWT(token);
     await gqlPost(
       `mutation CreateSmartContextSessionStats($input: CreateSmartContextSessionStatsInput!) {
         createSmartContextSessionStats(input: $input) { id }
@@ -163,7 +111,7 @@ async function main() {
       {
         input: {
           email: decoded.email,
-          sessionDate: session.date || new Date().toISOString().slice(0, 10),
+          sessionDate: session.date || lib.today(),
           hits,
           misses,
           tokensSaved,
@@ -173,7 +121,7 @@ async function main() {
         },
       }
     );
-    fs.writeFileSync(SESSION_FILE, JSON.stringify({}));
+    lib.deleteSession(sessionId);
   } catch { /* silent */ }
 
   process.exit(0);

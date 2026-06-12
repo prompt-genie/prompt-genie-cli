@@ -1,15 +1,11 @@
 #!/usr/bin/env node
 process.on("uncaughtException", (err) => { process.stderr.write("pg post_bash: " + err.message + "\n"); process.exit(0); });
-const fs = require("fs");
-const path = require("path");
-const crypto = require("crypto");
+const lib = require("./_lib.cjs");
 
-const BASH_CACHE_FILE = path.join(process.env.HOME, ".claude/pg_bash_cache.json");
-const SESSION_FILE    = path.join(process.env.HOME, ".claude/pg_session.json");
-const STATS_FILE      = path.join(process.env.HOME, ".claude/pg_stats.json");
-
-const MAX_OUTPUT_BYTES = 512_000; // skip caching huge outputs (>512 KB)
-const MAX_CACHE_ENTRIES = 300;
+const MAX_OUTPUT_BYTES = 512_000; // skip huge outputs (>512 KB)
+const MIN_OUTPUT_CHARS = 200;     // below this the replacement note saves nothing
+const MAX_BASH_ENTRIES = 300;
+const NOTE_TOKENS = 15;
 
 const READONLY_PREFIXES = [
   /^cat\s+/,
@@ -68,66 +64,68 @@ function isReadOnly(command) {
   return !UNSAFE_PATTERNS.some((re) => re.test(cmd));
 }
 
-function cacheKey(command) {
-  return crypto.createHash("sha1").update(process.cwd() + "\x00" + command).digest("hex");
+function extractOutput(toolResponse) {
+  if (typeof toolResponse === "string") return toolResponse;
+  if (!toolResponse || typeof toolResponse !== "object") return "";
+  if (typeof toolResponse.stdout === "string") {
+    return toolResponse.stdout + (toolResponse.stderr ? "\n" + toolResponse.stderr : "");
+  }
+  if (Array.isArray(toolResponse.content)) {
+    return toolResponse.content.map((b) => b.text ?? "").join("");
+  }
+  return JSON.stringify(toolResponse);
 }
 
-function loadJson(file) {
-  try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return {}; }
-}
-
-function saveJson(file, data) {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
-}
-
-function recordMiss() {
-  const stats = loadJson(STATS_FILE);
-  stats.total_misses = (stats.total_misses || 0) + 1;
-  saveJson(STATS_FILE, stats);
-
-  const session = loadJson(SESSION_FILE);
-  session.misses = (session.misses || 0) + 1;
-  session.date = new Date().toISOString().slice(0, 10);
-  saveJson(SESSION_FILE, session);
-}
-
-process.stdin.resume();
-let raw = "";
-process.stdin.on("data", (c) => (raw += c));
-process.stdin.on("end", () => {
-  let data;
-  try { data = JSON.parse(raw); } catch { process.exit(0); }
-
-  if (data.tool_name !== "Bash") process.exit(0);
+async function main() {
+  const data = await lib.readStdinJson();
+  if (!data || data.tool_name !== "Bash") process.exit(0);
 
   const command = data.tool_input?.command;
   if (!command || !isReadOnly(command)) process.exit(0);
 
-  let output = data.tool_response ?? "";
-  if (typeof output === "object") {
-    const blocks = output.content;
-    output = Array.isArray(blocks)
-      ? blocks.map((b) => b.text ?? "").join("")
-      : JSON.stringify(output);
+  const output = extractOutput(data.tool_response);
+  if (!output || output.length < MIN_OUTPUT_CHARS || output.length > MAX_OUTPUT_BYTES) process.exit(0);
+
+  const cwd = data.cwd || process.cwd();
+  const normalized = command.trim().replace(/\s+/g, " ");
+  const key = lib.sha1(cwd + "\x00" + normalized);
+  const hash = lib.sha1(output);
+
+  const session = lib.loadSession(data.session_id);
+  const bash = session.bash || {};
+  const prev = bash[key];
+
+  if (hash && prev && prev.hash === hash) {
+    // Same command, byte-identical output, earlier this session — the output
+    // is already in context, so replace it with a brief note
+    const lineCount = output.split("\n").length;
+    const tokensSaved = Math.max(0, lib.estimateTokens(output) - NOTE_TOKENS);
+
+    session.hits = (session.hits || 0) + 1;
+    session.tokensSaved = (session.tokensSaved || 0) + tokensSaved;
+    session.date = lib.today();
+    lib.saveSession(data.session_id, session);
+    lib.bumpStats({ hits: 1, tokensSaved });
+
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "PostToolUse",
+        updatedToolOutput: `[Output unchanged since you ran this command earlier this session. ${lineCount} lines. Refer to the earlier output.]`,
+      },
+    }));
+    process.exit(0);
   }
 
-  if (!output || output.length > MAX_OUTPUT_BYTES) process.exit(0);
-
-  const key = cacheKey(command);
-  const bashCache = loadJson(BASH_CACHE_FILE);
-
-  // Evict oldest entries if over limit
-  const keys = Object.keys(bashCache);
-  if (keys.length >= MAX_CACHE_ENTRIES) {
-    const sorted = keys.sort((a, b) => (bashCache[a].ts || 0) - (bashCache[b].ts || 0));
-    for (let i = 0; i < Math.floor(MAX_CACHE_ENTRIES * 0.2); i++) {
-      delete bashCache[sorted[i]];
-    }
-  }
-
-  bashCache[key] = { cmd: command.slice(0, 120), ts: Date.now(), output };
-  saveJson(BASH_CACHE_FILE, bashCache);
-  recordMiss();
+  // First run, or output changed — record the hash only (never the output)
+  bash[key] = { cmd: normalized.slice(0, 120), hash, ts: Date.now() };
+  lib.evictOldest(bash, MAX_BASH_ENTRIES);
+  session.bash = bash;
+  session.misses = (session.misses || 0) + 1;
+  session.date = lib.today();
+  lib.saveSession(data.session_id, session);
+  lib.bumpStats({ misses: 1 });
 
   process.exit(0);
-});
+}
+
+main();

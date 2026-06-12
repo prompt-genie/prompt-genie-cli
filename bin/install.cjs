@@ -98,6 +98,9 @@ function wireHooks() {
   settings.hooks.UserPromptSubmit = [
     { hooks: [{ type: "command", command: `node ${path.join(HOOKS_DEST, "user_prompt_submit.cjs")}` }] },
   ];
+  settings.hooks.SessionStart = [
+    { hooks: [{ type: "command", command: `node ${path.join(HOOKS_DEST, "session_start.cjs")}` }] },
+  ];
   settings.hooks.Stop = [
     { hooks: [{ type: "command", command: `node ${path.join(HOOKS_DEST, "stop_flush.cjs")}` }] },
   ];

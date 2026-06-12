@@ -1,11 +1,6 @@
 #!/usr/bin/env node
 const fs = require("fs");
-const path = require("path");
-const crypto = require("crypto");
-
-const CACHE_FILE   = path.join(process.env.HOME, ".claude/pg_read_cache.json");
-const STATS_FILE   = path.join(process.env.HOME, ".claude/pg_stats.json");
-const SESSION_FILE = path.join(process.env.HOME, ".claude/pg_session.json");
+const lib = require("./_lib.cjs");
 
 // Never let a hook crash silently — Claude Code shows "No stderr output" with no detail
 process.on("uncaughtException", (err) => {
@@ -13,21 +8,8 @@ process.on("uncaughtException", (err) => {
   process.exit(0); // Always pass through on error
 });
 
-function loadJson(file) {
-  try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return {}; }
-}
-
-function saveJson(file, data) {
-  try { fs.writeFileSync(file, JSON.stringify(data, null, 2)); } catch { /* silent */ }
-}
-
-function hashContent(str) {
-  try { return crypto.createHash("sha1").update(str).digest("hex"); } catch { return null; }
-}
-
-function estimateTokens(text) {
-  return Math.max(1, Math.floor(text.length / 4));
-}
+const MAX_FILE_ENTRIES = 500;
+const NOTE_TOKENS = 15; // rough size of the replacement note
 
 function extractText(toolResponse) {
   if (typeof toolResponse === "string") return toolResponse;
@@ -43,38 +25,9 @@ function extractText(toolResponse) {
   return JSON.stringify(toolResponse);
 }
 
-function recordHit(tokensSaved) {
-  const stats = loadJson(STATS_FILE);
-  stats.total_hits = (stats.total_hits || 0) + 1;
-  stats.total_tokens_saved = (stats.total_tokens_saved || 0) + tokensSaved;
-  saveJson(STATS_FILE, stats);
-
-  const session = loadJson(SESSION_FILE);
-  session.hits = (session.hits || 0) + 1;
-  session.tokensSaved = (session.tokensSaved || 0) + tokensSaved;
-  session.date = new Date().toISOString().slice(0, 10);
-  saveJson(SESSION_FILE, session);
-}
-
-function recordMiss() {
-  const stats = loadJson(STATS_FILE);
-  stats.total_misses = (stats.total_misses || 0) + 1;
-  saveJson(STATS_FILE, stats);
-
-  const session = loadJson(SESSION_FILE);
-  session.misses = (session.misses || 0) + 1;
-  session.date = new Date().toISOString().slice(0, 10);
-  saveJson(SESSION_FILE, session);
-}
-
-process.stdin.resume();
-let raw = "";
-process.stdin.on("data", (c) => (raw += c));
-process.stdin.on("end", () => {
-  let data;
-  try { data = JSON.parse(raw); } catch { process.exit(0); }
-
-  if (data.tool_name !== "Read") process.exit(0);
+async function main() {
+  const data = await lib.readStdinJson();
+  if (!data || data.tool_name !== "Read") process.exit(0);
 
   const filePath = data.tool_input?.file_path;
   if (!filePath) process.exit(0);
@@ -82,21 +35,28 @@ process.stdin.on("end", () => {
   const content = extractText(data.tool_response);
   if (!content) process.exit(0);
 
-  const hash = hashContent(content);
-  const cache = loadJson(CACHE_FILE);
-  const session = loadJson(SESSION_FILE);
-  const filesRead = session.filesRead || [];
+  // Key by file + range so partial reads of big files dedupe independently
+  // and a chunked read never clobbers the full-read entry
+  const offset = data.tool_input?.offset ?? 0;
+  const limit = data.tool_input?.limit ?? "all";
+  const key = `${filePath}@${offset}-${limit}`;
 
-  // Check if this file was already read earlier in this session with identical content
-  const isRepeat = filesRead.includes(filePath);
-  const cachedHash = cache[filePath]?.hash;
+  const hash = lib.sha1(content);
+  const session = lib.loadSession(data.session_id);
+  const files = session.files || {};
+  const prev = files[key];
 
-  if (isRepeat && hash && cachedHash && hash === cachedHash) {
-    // File is already in Claude's context and hasn't changed — replace content with brief note
-    // This uses updatedToolOutput so Claude gets ~10 tokens instead of the full file
+  if (hash && prev && prev.hash === hash) {
+    // Same range delivered earlier this session with identical content —
+    // replace it with a brief note so Claude gets ~15 tokens instead of the full file
     const lineCount = content.split("\n").length;
-    const tokensSaved = Math.max(0, estimateTokens(content) - 15);
-    recordHit(tokensSaved);
+    const tokensSaved = Math.max(0, lib.estimateTokens(content) - NOTE_TOKENS);
+
+    session.hits = (session.hits || 0) + 1;
+    session.tokensSaved = (session.tokensSaved || 0) + tokensSaved;
+    session.date = lib.today();
+    lib.saveSession(data.session_id, session);
+    lib.bumpStats({ hits: 1, tokensSaved });
 
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
@@ -107,18 +67,19 @@ process.stdin.on("end", () => {
     process.exit(0);
   }
 
-  // First read or content changed — update cache and session tracking
+  // First read of this range, or content changed — record it
   let mtime = null;
   try { mtime = fs.statSync(filePath).mtimeMs; } catch { /* ok */ }
 
-  cache[filePath] = { mtime, hash, content };
-  saveJson(CACHE_FILE, cache);
+  files[key] = { path: filePath, hash, mtime, ts: Date.now() };
+  lib.evictOldest(files, MAX_FILE_ENTRIES);
+  session.files = files;
+  session.misses = (session.misses || 0) + 1;
+  session.date = lib.today();
+  lib.saveSession(data.session_id, session);
+  lib.bumpStats({ misses: 1 });
 
-  if (!filesRead.includes(filePath)) filesRead.push(filePath);
-  session.filesRead = filesRead;
-  session.date = new Date().toISOString().slice(0, 10);
-  saveJson(SESSION_FILE, session);
-
-  recordMiss();
   process.exit(0);
-});
+}
+
+main();
