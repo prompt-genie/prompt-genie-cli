@@ -58,12 +58,17 @@ async function main() {
     lib.saveSession(data.session_id, session);
     lib.bumpStats({ hits: 1, tokensSaved });
 
-    process.stdout.write(JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: "PostToolUse",
-        updatedToolOutput: `[Already in context — file unchanged since your last read. ${lineCount} lines. Refer to your earlier read for the content.]`,
-      },
-    }));
+    // Paid plans get the actual benefit: replace the repeated content with a
+    // short note. Free plans are measured only (we recorded the would-be saving
+    // above) and the full content passes through unchanged.
+    if (lib.currentPlanIsPaid()) {
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: "PostToolUse",
+          updatedToolOutput: `[Already in context, file unchanged since your last read. ${lineCount} lines. Refer to your earlier read for the content.]`,
+        },
+      }));
+    }
     process.exit(0);
   }
 

@@ -107,12 +107,16 @@ async function main() {
     lib.saveSession(data.session_id, session);
     lib.bumpStats({ hits: 1, tokensSaved });
 
-    process.stdout.write(JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: "PostToolUse",
-        updatedToolOutput: `[Output unchanged since you ran this command earlier this session. ${lineCount} lines. Refer to the earlier output.]`,
-      },
-    }));
+    // Paid plans get the actual benefit: replace the repeated output with a
+    // short note. Free plans are measured only and the output passes through.
+    if (lib.currentPlanIsPaid()) {
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: "PostToolUse",
+          updatedToolOutput: `[Output unchanged since you ran this command earlier this session. ${lineCount} lines. Refer to the earlier output.]`,
+        },
+      }));
+    }
     process.exit(0);
   }
 

@@ -8,11 +8,33 @@
  */
 
 const { spawnSync } = require("child_process");
-const fs   = require("fs");
-const path = require("path");
-const os   = require("os");
+const fs     = require("fs");
+const path   = require("path");
+const os     = require("os");
+const crypto = require("crypto");
 
 const HOOKS_DIR = path.join(__dirname, "..", "dist", "hooks");
+
+// ── Test auth keypair ───────────────────────────────────────────────────────
+// The hooks verify the plan JWT against PG_PUBLIC_KEY (falling back to the
+// baked-in key in production). We generate a throwaway keypair, point the hooks
+// at our public key, and sign our own paid/free tokens so the paid-gating path
+// is exercised with real signature verification.
+const { publicKey: testPublicKey, privateKey: testPrivateKey } = crypto.generateKeyPairSync("rsa", {
+  modulusLength: 2048,
+  publicKeyEncoding:  { type: "spki",  format: "pem" },
+  privateKeyEncoding: { type: "pkcs8", format: "pem" },
+});
+process.env.PG_PUBLIC_KEY = testPublicKey;
+
+function makeToken(plan) {
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
+  const header  = b64({ alg: "RS256", typ: "JWT" });
+  const payload = b64({ email: "test@example.com", plan, exp: Math.floor(Date.now() / 1000) + 3600 });
+  const signer = crypto.createSign("RSA-SHA256");
+  signer.update(`${header}.${payload}`);
+  return `${header}.${payload}.${signer.sign(testPrivateKey, "base64url")}`;
+}
 
 // ── Isolated home dir ─────────────────────────────────────────────────────────
 
@@ -33,6 +55,15 @@ function writeClaudeFile(name, data) {
     path.join(claudeDir, name),
     typeof data === "string" ? data : JSON.stringify(data, null, 2)
   );
+}
+
+function writePaidConfig() {
+  writeClaudeFile("pg_config.json", { email: "test@example.com", plan: "PRO", token: makeToken("PRO") });
+}
+
+function writeFreeConfig() {
+  // No token => currentPlanIsPaid() is false => measure-only, no suppression.
+  removeClaudeFile("pg_config.json");
 }
 
 function removeClaudeFile(name) {
@@ -210,6 +241,10 @@ test("never exits 2 (must not block Bash commands)", () => {
 
 // ── post_read tests ───────────────────────────────────────────────────────────
 
+// Default to a paid plan so the suppression mechanics are exercised. Individual
+// tests below switch to a free config to verify gating.
+writePaidConfig();
+
 console.log("\n  post_read");
 
 test("exits 0 on malformed JSON", () => {
@@ -246,6 +281,22 @@ test("repeated read (same content): outputs valid updatedToolOutput JSON", () =>
   const session = readSession(SID);
   assert(session.hits === 1,        `expected 1 hit, got ${session.hits}`);
   assert(session.tokensSaved >= 0,  "tokensSaved missing");
+});
+
+test("free plan: repeat read is measured but NOT suppressed", () => {
+  writeFreeConfig();
+  clearSessions();
+  const first = runHook("post_read.cjs", postReadEvent(testFile, testContent));
+  expectPassThrough(first, "free first read");
+
+  const repeat = runHook("post_read.cjs", postReadEvent(testFile, testContent));
+  expectPassThrough(repeat, "free repeat read must not be suppressed");
+
+  const session = readSession(SID);
+  assert(session.hits === 1,       `free repeat should still record a hit, got ${session.hits}`);
+  assert(session.tokensSaved > 0,  "free plan must still record would-be tokensSaved for the upgrade prompt");
+
+  writePaidConfig(); // restore for subsequent tests
 });
 
 test("repeated read (changed content): passes through", () => {
@@ -329,6 +380,21 @@ test("repeat command with identical output: suppressed via updatedToolOutput", (
 
   const session = readSession(SID);
   assert(session.hits >= 1, `expected a hit, got ${session.hits}`);
+});
+
+test("free plan: repeat command is measured but NOT suppressed", () => {
+  writeFreeConfig();
+  clearSessions();
+  const first = runHook("post_bash.cjs", postBashEvent("ls -la", bigBashOutput));
+  expectPassThrough(first, "free first bash run");
+
+  const repeat = runHook("post_bash.cjs", postBashEvent("ls -la", bigBashOutput));
+  expectPassThrough(repeat, "free repeat bash run must not be suppressed");
+
+  const session = readSession(SID);
+  assert(session.hits >= 1, `free repeat should still record a hit, got ${session.hits}`);
+
+  writePaidConfig(); // restore for subsequent tests
 });
 
 test("repeat command with changed output: passes through", () => {

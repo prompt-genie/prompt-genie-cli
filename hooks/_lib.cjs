@@ -10,7 +10,7 @@ const SESSIONS_DIR = path.join(CLAUDE_DIR, "pg_sessions");
 const STATS_FILE   = path.join(CLAUDE_DIR, "pg_stats.json");
 const CONFIG_FILE  = path.join(CLAUDE_DIR, "pg_config.json");
 
-const PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
+const PUBLIC_KEY = process.env.PG_PUBLIC_KEY || `-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArjBMJfK6K8JnPvZR3kuS
 d80nO2gvF2AULghE6WNtD1N0+k2GPShpGBiV/6WugrP840i8MRL+fyBid7DQw6Tj
 eqZ7lj8wHTKglNZCRgOvmV+Q9LOpUfDCV+znUlEJLlbZy73X2CNPN6D2kfKPL7yT
@@ -128,6 +128,20 @@ function isPaidPlan(plan) {
   return ["PRO", "ANNUAL_PRO", "THREE_DAY_PASS", "TEAMS", "ENTERPRISE"].includes(plan);
 }
 
+// True only when the local config holds a signature-valid, unexpired paid token.
+// Used to gate the actual context-memory benefit: free users are measured but
+// their repeat reads/commands are NOT served from memory.
+function currentPlanIsPaid() {
+  try {
+    const config = loadJson(CONFIG_FILE);
+    if (!config || !config.token) return false;
+    const jwt = verifyJWT(config.token);
+    return !!(jwt && isPaidPlan(jwt.plan));
+  } catch {
+    return false;
+  }
+}
+
 // ── stdin ─────────────────────────────────────────────────────────────────────
 
 // Resolves with the parsed hook event, or null on malformed/missing input.
@@ -154,6 +168,6 @@ module.exports = {
   sha1, estimateTokens, today,
   sessionFile, loadSession, saveSession, deleteSession, gcSessions, evictOldest,
   bumpStats,
-  verifyJWT, decodeJWT, isPaidPlan,
+  verifyJWT, decodeJWT, isPaidPlan, currentPlanIsPaid,
   readStdinJson,
 };
