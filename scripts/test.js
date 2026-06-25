@@ -352,6 +352,64 @@ test("state files are valid JSON after a run (atomic writes, no tmp leftovers)",
   assert(leftovers.length === 0, `tmp files left behind: ${leftovers.join(", ")}`);
 });
 
+// ── post_read delta tests (edit -> re-read) ─────────────────────────────────────
+
+console.log("\n  post_read delta");
+
+// A large file (well over DELTA_MIN_CHARS) so the delta path is eligible.
+const bigLines = Array.from({ length: 300 }, (_, i) => `const line${i} = ${i}; // value ${i}`);
+const bigFile = bigLines.join("\n") + "\n";
+const editedFile = bigLines.map((l, i) => (i === 150 ? `const line150 = 999; // CHANGED` : l)).join("\n") + "\n";
+
+test("first large read stores text for diffing", () => {
+  clearSessions();
+  const r = runHook("post_read.cjs", postReadEvent(testFile, bigFile));
+  expectPassThrough(r, "first large read");
+  const entry = Object.values(readSession(SID).files).find((e) => e.path === testFile);
+  assert(entry && typeof entry.text === "string", "large read should retain text for delta");
+});
+
+test("re-read after a small edit: serves a delta, not the whole file", () => {
+  const r = runHook("post_read.cjs", postReadEvent(testFile, editedFile));
+  expectSuppression(r, "edited re-read");
+  const out = parseJSON(r.stdout);
+  const note = out.hookSpecificOutput.updatedToolOutput;
+  assert(/Prompt Genie delta/.test(note), "expected a delta note");
+  assert(note.includes("line150 = 999"), "delta must contain the changed line");
+  assert(note.length < editedFile.length / 2, "delta must be much smaller than the full file");
+
+  const session = readSession(SID);
+  assert(session.hits >= 1, "delta should record a hit");
+  assert(session.tokensSaved > 0, "delta should record tokens saved");
+});
+
+test("delta advances the stored copy (second small edit also deltas)", () => {
+  const edited2 = bigLines.map((l, i) => (i === 150 ? `const line150 = 12345; // CHANGED AGAIN` : l)).join("\n") + "\n";
+  const r = runHook("post_read.cjs", postReadEvent(testFile, edited2));
+  expectSuppression(r, "second edited re-read");
+  assert(parseJSON(r.stdout).hookSpecificOutput.updatedToolOutput.includes("12345"), "second delta must reflect newest change");
+});
+
+test("wholesale rewrite is too big to delta: passes through", () => {
+  clearSessions();
+  runHook("post_read.cjs", postReadEvent(testFile, bigFile));
+  const rewritten = Array.from({ length: 300 }, (_, i) => `totally different content row ${i} ${"x".repeat(20)}`).join("\n") + "\n";
+  const r = runHook("post_read.cjs", postReadEvent(testFile, rewritten));
+  expectPassThrough(r, "wholesale rewrite");
+  assert(readSession(SID).misses >= 1, "wholesale change should count as a miss");
+});
+
+test("free plan: delta is measured but NOT served", () => {
+  writeFreeConfig();
+  clearSessions();
+  runHook("post_read.cjs", postReadEvent(testFile, bigFile));
+  const r = runHook("post_read.cjs", postReadEvent(testFile, editedFile));
+  expectPassThrough(r, "free delta must not be served");
+  const session = readSession(SID);
+  assert(session.hits >= 1 && session.tokensSaved > 0, "free plan must still measure the delta saving");
+  writePaidConfig(); // restore
+});
+
 // ── post_bash tests ───────────────────────────────────────────────────────────
 
 console.log("\n  post_bash");

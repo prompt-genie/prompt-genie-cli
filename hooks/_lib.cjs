@@ -50,6 +50,47 @@ function today() {
   return new Date().toISOString().slice(0, 10);
 }
 
+// Build a compact "reuse your earlier copy + apply this change" note describing
+// how currText differs from prevText, assuming prevText is already in the model's
+// context (it was delivered on the earlier read/run). Uses a common-prefix /
+// common-suffix diff: O(n), and perfectly tight for the dominant case of an edit
+// to one contiguous region. Returns { note, savedTokens } only when the delta is
+// meaningfully smaller than the full text — otherwise null, and the caller passes
+// the full text through unchanged. Lossless by reconstruction.
+function buildLineDelta(prevText, currText, kind) {
+  if (typeof prevText !== "string" || typeof currText !== "string") return null;
+  if (prevText === currText) return null; // exact match is handled elsewhere
+
+  const a = prevText.split("\n");
+  const b = currText.split("\n");
+  const aN = a.length;
+  const bN = b.length;
+
+  let p = 0;
+  while (p < aN && p < bN && a[p] === b[p]) p++;
+  let s = 0;
+  while (s < aN - p && s < bN - p && a[aN - 1 - s] === b[bN - 1 - s]) s++;
+
+  const removed = a.slice(p, aN - s);
+  const added = b.slice(p, bN - s);
+
+  const note =
+    `[Prompt Genie delta] This ${kind} is identical to your previous ${kind} of the same ` +
+    `target except for one region — reuse that earlier copy and apply this change:\n` +
+    `- lines 1-${p} unchanged\n` +
+    `- the last ${s} line(s) unchanged\n` +
+    `- at line ${p + 1}, replace these ${removed.length} line(s):\n` +
+    (removed.length ? removed.join("\n") + "\n" : "(none)\n") +
+    `- with these ${added.length} line(s):\n` +
+    (added.length ? added.join("\n") : "(none)");
+
+  const fullTokens = estimateTokens(currText);
+  const noteTokens = estimateTokens(note);
+  // Only worth it if the delta is comfortably smaller than the full content.
+  if (noteTokens >= Math.floor(fullTokens * 0.6)) return null;
+  return { note, savedTokens: Math.max(0, fullTokens - noteTokens) };
+}
+
 // ── Per-session state ─────────────────────────────────────────────────────────
 
 function sessionFile(sessionId) {
@@ -165,7 +206,7 @@ function readStdinJson(timeoutMs = 2000) {
 module.exports = {
   CLAUDE_DIR, SESSIONS_DIR, STATS_FILE, CONFIG_FILE, PUBLIC_KEY,
   loadJson, saveJsonAtomic, unlinkQuiet,
-  sha1, estimateTokens, today,
+  sha1, estimateTokens, today, buildLineDelta,
   sessionFile, loadSession, saveSession, deleteSession, gcSessions, evictOldest,
   bumpStats,
   verifyJWT, decodeJWT, isPaidPlan, currentPlanIsPaid,
