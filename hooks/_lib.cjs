@@ -166,7 +166,7 @@ function decodeJWT(token) {
 }
 
 function isPaidPlan(plan) {
-  return ["PRO", "ANNUAL_PRO", "THREE_DAY_PASS", "TEAMS", "ENTERPRISE"].includes(plan);
+  return ["PRO", "ANNUAL_PRO", "THREE_DAY_PASS", "TEAMS", "ENTERPRISE", "LIFETIME"].includes(plan);
 }
 
 // True only when the local config holds a signature-valid, unexpired paid token.

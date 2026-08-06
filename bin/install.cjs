@@ -112,7 +112,7 @@ function finishInstall(email, plan, token) {
   wireHooks();
   saveJson(CONFIG_FILE, { email, plan, token });
 
-  const isPaid = ["PRO", "ANNUAL_PRO", "THREE_DAY_PASS", "TEAMS", "ENTERPRISE"].includes(plan);
+  const isPaid = ["PRO", "ANNUAL_PRO", "THREE_DAY_PASS", "TEAMS", "ENTERPRISE", "LIFETIME"].includes(plan);
   if (isPaid) {
     console.log(`
   You're all set.
