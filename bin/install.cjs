@@ -84,25 +84,35 @@ function copyHooks() {
   }
 }
 
+// Build a hook command string for settings.json. Claude Code runs these through
+// a shell, which eats backslashes as escapes, so a Windows path.join result like
+// C:\Users\me\.prompt-genie\hooks\pre_read.cjs collapses to C:Usersme... and the
+// hook dies with MODULE_NOT_FOUND. Normalize to forward slashes (Node accepts
+// them on every platform) and quote for paths that contain spaces.
+function hookCommand(file) {
+  const p = path.join(HOOKS_DEST, file).replace(/\\/g, "/");
+  return `node "${p}"`;
+}
+
 function wireHooks() {
   const settings = loadJson(SETTINGS_FILE);
   settings.hooks = settings.hooks || {};
   settings.hooks.PreToolUse = [
-    { matcher: "Read", hooks: [{ type: "command", command: `node ${path.join(HOOKS_DEST, "pre_read.cjs")}` }] },
-    { matcher: "Bash", hooks: [{ type: "command", command: `node ${path.join(HOOKS_DEST, "pre_bash.cjs")}` }] },
+    { matcher: "Read", hooks: [{ type: "command", command: hookCommand("pre_read.cjs") }] },
+    { matcher: "Bash", hooks: [{ type: "command", command: hookCommand("pre_bash.cjs") }] },
   ];
   settings.hooks.PostToolUse = [
-    { matcher: "Read", hooks: [{ type: "command", command: `node ${path.join(HOOKS_DEST, "post_read.cjs")}` }] },
-    { matcher: "Bash", hooks: [{ type: "command", command: `node ${path.join(HOOKS_DEST, "post_bash.cjs")}` }] },
+    { matcher: "Read", hooks: [{ type: "command", command: hookCommand("post_read.cjs") }] },
+    { matcher: "Bash", hooks: [{ type: "command", command: hookCommand("post_bash.cjs") }] },
   ];
   settings.hooks.UserPromptSubmit = [
-    { hooks: [{ type: "command", command: `node ${path.join(HOOKS_DEST, "user_prompt_submit.cjs")}` }] },
+    { hooks: [{ type: "command", command: hookCommand("user_prompt_submit.cjs") }] },
   ];
   settings.hooks.SessionStart = [
-    { hooks: [{ type: "command", command: `node ${path.join(HOOKS_DEST, "session_start.cjs")}` }] },
+    { hooks: [{ type: "command", command: hookCommand("session_start.cjs") }] },
   ];
   settings.hooks.Stop = [
-    { hooks: [{ type: "command", command: `node ${path.join(HOOKS_DEST, "stop_flush.cjs")}` }] },
+    { hooks: [{ type: "command", command: hookCommand("stop_flush.cjs") }] },
   ];
   saveJson(SETTINGS_FILE, settings);
 }
