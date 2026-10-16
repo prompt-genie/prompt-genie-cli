@@ -46,8 +46,10 @@ function estimateTokens(text) {
   return Math.max(1, Math.floor(text.length / 4));
 }
 
+// The user's local calendar day, so evening sessions don't land on tomorrow (UTC).
 function today() {
-  return new Date().toISOString().slice(0, 10);
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
 // Build a compact "reuse your earlier copy + apply this change" note describing

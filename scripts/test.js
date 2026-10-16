@@ -611,6 +611,195 @@ test("garbage-collects week-old session files", () => {
   assert(fs.existsSync(path.join(sessionsDir, "fresh.json")),    "fresh session file must survive GC");
 });
 
+// ── Upload tests (against a local fake backend) ───────────────────────────────
+
+console.log("\n  stop_flush uploads");
+
+// A tiny GraphQL stand-in in a separate process (the tests run hooks with
+// spawnSync, which blocks this process). It logs every request body and answers
+// with response.json when present.
+const fakeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pg-fake-api-"));
+const fakeServer = require("child_process").spawn(process.execPath, ["-e", `
+  const http = require("http"), fs = require("fs"), dir = process.argv[1];
+  const srv = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      fs.appendFileSync(dir + "/requests.log", body + "\\n");
+      let resp = { data: { recordTokenSavings: JSON.stringify({ success: true, recorded: 1, duplicates: 0 }) } };
+      try { resp = JSON.parse(fs.readFileSync(dir + "/response.json", "utf8")); } catch {}
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify(resp));
+    });
+  });
+  srv.listen(0, "127.0.0.1", () => fs.writeFileSync(dir + "/port", String(srv.address().port)));
+`, fakeDir], { stdio: "ignore" });
+
+const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+for (let i = 0; i < 100 && !fs.existsSync(path.join(fakeDir, "port")); i++) sleep(50);
+const fakeUrl = `http://127.0.0.1:${fs.readFileSync(path.join(fakeDir, "port"), "utf8")}/graphql`;
+
+function useFakeApi(url = fakeUrl) {
+  process.env.PG_GRAPHQL_URL = url;
+}
+function fakeRequests() {
+  try {
+    return fs.readFileSync(path.join(fakeDir, "requests.log"), "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  } catch { return []; }
+}
+function resetFake(response) {
+  removeFile(path.join(fakeDir, "requests.log"));
+  removeFile(path.join(fakeDir, "response.json"));
+  if (response) fs.writeFileSync(path.join(fakeDir, "response.json"), JSON.stringify(response));
+}
+function removeFile(f) { try { fs.unlinkSync(f); } catch {} }
+const serverSays = (result) => ({ data: { recordTokenSavings: JSON.stringify(result) } });
+
+const sessionWithSavings = () => ({
+  hits: 4,
+  misses: 6,
+  tokensSaved: 9000,
+  date: new Date().toISOString().slice(0, 10),
+  files: { [`${testFile}@0-all`]: { path: testFile, hash: "abc", ts: Date.now() } },
+});
+
+test("paid: uploads the turn's savings with the signed token and no email", () => {
+  useFakeApi();
+  resetFake();
+  clearSessions();
+  writePaidConfig();
+  writeSession(SID, sessionWithSavings());
+  const r = runHook("stop_flush.cjs", { hook_event_name: "Stop", session_id: SID, cwd: "/work/shop-api" });
+  assert(r.exitCode === 0, `exit ${r.exitCode}. stderr: ${r.stderr}`);
+  const reqs = fakeRequests();
+  assert(reqs.length === 1, `expected 1 request, got ${reqs.length}`);
+  assert(/recordTokenSavings/.test(reqs[0].query), "should call recordTokenSavings");
+  const savedToken = JSON.parse(fs.readFileSync(path.join(claudeDir, "pg_config.json"), "utf8")).token;
+  assert(reqs[0].variables.token === savedToken, "sends the signed CLI token");
+  const entries = JSON.parse(reqs[0].variables.entries);
+  assert(entries.length === 1, "one entry");
+  const e = entries[0];
+  assert(e.source === "CLAUDE_CODE" && e.feature === "CONTEXT_MEMORY", "source/feature");
+  assert(e.hits === 4 && e.misses === 6 && e.tokensSaved === 9000, "counts");
+  assert(e.codebase === "shop-api", `codebase ${e.codebase}`);
+  assert(/^cc-[0-9a-f-]{36}$/.test(e.id), `id ${e.id}`);
+  assert(!("email" in e) && !JSON.stringify(reqs[0].variables).includes("test@example.com"), "no email in the request");
+});
+
+test("paid: counters reset after upload but the read memory survives (re-reads keep hitting)", () => {
+  const s = readSession(SID);
+  assert(s && s.hits === 0 && s.misses === 0 && s.tokensSaved === 0, "counters reset");
+  assert(Object.keys(s.files || {}).length === 1, "files map must survive the Stop hook");
+  assert((s.pendingUploads || []).length === 0, "nothing left pending");
+});
+
+test("paid: offline keeps the upload pending and retries it with the same id", () => {
+  useFakeApi("http://127.0.0.1:1/graphql"); // nothing listens on port 1
+  clearSessions();
+  writePaidConfig();
+  writeSession(SID, sessionWithSavings());
+  runHook("stop_flush.cjs", { hook_event_name: "Stop", session_id: SID, cwd: "/work/app" });
+  const pending = readSession(SID).pendingUploads || [];
+  assert(pending.length === 1, `expected 1 pending, got ${pending.length}`);
+  const id = pending[0].id;
+
+  useFakeApi();
+  resetFake();
+  const s = readSession(SID);
+  s.hits = 1; s.misses = 1; s.tokensSaved = 50;
+  writeSession(SID, s);
+  runHook("stop_flush.cjs", { hook_event_name: "Stop", session_id: SID, cwd: "/work/app" });
+  const entries = JSON.parse(fakeRequests()[0].variables.entries);
+  assert(entries.length === 2, `expected retry + new entry, got ${entries.length}`);
+  assert(entries[0].id === id && entries[0].tokensSaved === 9000, "retry reuses the original id and numbers");
+  assert(entries[1].tokensSaved === 50, "new savings sent as their own entry");
+  assert((readSession(SID).pendingUploads || []).length === 0, "cleared after success");
+});
+
+test("paid: a temporary server error keeps the upload for retry", () => {
+  useFakeApi();
+  resetFake(serverSays({ success: false, error: "Write failed" }));
+  clearSessions();
+  writePaidConfig();
+  writeSession(SID, sessionWithSavings());
+  runHook("stop_flush.cjs", { hook_event_name: "Stop", session_id: SID });
+  assert((readSession(SID).pendingUploads || []).length === 1, "kept for retry");
+});
+
+test("paid: a rejected batch is dropped instead of retried forever", () => {
+  useFakeApi();
+  resetFake(serverSays({ success: false, error: "Entry 0: invalid tokensSaved" }));
+  clearSessions();
+  writePaidConfig();
+  writeSession(SID, sessionWithSavings());
+  runHook("stop_flush.cjs", { hook_event_name: "Stop", session_id: SID });
+  assert((readSession(SID).pendingUploads || []).length === 0, "dropped");
+});
+
+test("paid: uploads stuck offline for weeks are dropped (server would reject the old date)", () => {
+  useFakeApi();
+  resetFake();
+  clearSessions();
+  writePaidConfig();
+  const old = new Date(Date.now() - 40 * 86_400_000).toISOString().slice(0, 10);
+  writeSession(SID, { hits: 0, misses: 0, tokensSaved: 0, pendingUploads: [{ id: "cc-old-upload-0001", date: old, source: "CLAUDE_CODE", feature: "CONTEXT_MEMORY", hits: 1, misses: 1, tokensSaved: 10 }] });
+  runHook("stop_flush.cjs", { hook_event_name: "Stop", session_id: SID });
+  assert(fakeRequests().length === 0, "nothing worth sending");
+  assert((readSession(SID).pendingUploads || []).length === 0, "stale upload dropped");
+});
+
+test("free: never uploads, resets counters, keeps the read memory", () => {
+  useFakeApi();
+  resetFake();
+  clearSessions();
+  writeClaudeFile("pg_config.json", { email: "test@example.com", plan: "FREE", token: makeToken("FREE") });
+  writeSession(SID, sessionWithSavings());
+  const r = runHook("stop_flush.cjs", { hook_event_name: "Stop", session_id: SID });
+  assert(fakeRequests().length === 0, "free plan must not upload");
+  assert(/Context Memory paused/.test(r.stderr), "shows what it would have saved");
+  const s = readSession(SID);
+  assert(s.tokensSaved === 0 && Object.keys(s.files || {}).length === 1, "counters reset, memory kept");
+});
+
+fakeServer.kill();
+delete process.env.PG_GRAPHQL_URL;
+fs.rmSync(fakeDir, { recursive: true, force: true });
+
+// ── Installer: hooks are merged, not overwritten ──────────────────────────────
+
+console.log("\n  install");
+
+test("keeps the user's own hooks and replaces only ours, idempotently", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pg-install-"));
+  fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+  const settingsFile = path.join(home, ".claude", "settings.json");
+  fs.writeFileSync(settingsFile, JSON.stringify({
+    model: "opus",
+    hooks: {
+      PreToolUse: [
+        { matcher: "Bash", hooks: [{ type: "command", command: "my-linter --check" }] },
+        { matcher: "Read", hooks: [{ type: "command", command: `node "${home}/.prompt-genie/hooks/pre_read.cjs"` }] },
+      ],
+      Notification: [{ hooks: [{ type: "command", command: "say done" }] }],
+    },
+  }));
+  const run = () => spawnSync(process.execPath, ["-e", `require(${JSON.stringify(path.join(__dirname, "..", "bin", "install.cjs"))}).wireHooks()`], {
+    env: { ...process.env, HOME: home, USERPROFILE: home },
+    encoding: "utf8",
+  });
+  const r1 = run();
+  assert(r1.status === 0, `install exited ${r1.status}: ${r1.stderr}`);
+  run(); // reinstall must not duplicate
+  const s = JSON.parse(fs.readFileSync(settingsFile, "utf8"));
+  const commands = (event) => (s.hooks[event] || []).flatMap((g) => g.hooks.map((h) => h.command));
+  assert(s.model === "opus", "other settings untouched");
+  assert(commands("PreToolUse").includes("my-linter --check"), "user's PreToolUse hook kept");
+  assert(commands("Notification").includes("say done"), "user's other events kept");
+  assert(commands("PreToolUse").filter((c) => c.includes("pre_read.cjs")).length === 1, "our pre_read hook present exactly once");
+  assert(commands("Stop").filter((c) => c.includes("stop_flush.cjs")).length === 1, "our Stop hook present exactly once");
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
 // ── Summary ───────────────────────────────────────────────────────────────────
 
 fs.rmSync(tmpHome, { recursive: true, force: true });

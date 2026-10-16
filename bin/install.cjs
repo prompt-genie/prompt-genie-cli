@@ -94,26 +94,40 @@ function hookCommand(file) {
   return `node "${p}"`;
 }
 
+// Our hook groups, by Claude Code event.
+function ourHooks() {
+  return {
+    PreToolUse: [
+      { matcher: "Read", hooks: [{ type: "command", command: hookCommand("pre_read.cjs") }] },
+      { matcher: "Bash", hooks: [{ type: "command", command: hookCommand("pre_bash.cjs") }] },
+    ],
+    PostToolUse: [
+      { matcher: "Read", hooks: [{ type: "command", command: hookCommand("post_read.cjs") }] },
+      { matcher: "Bash", hooks: [{ type: "command", command: hookCommand("post_bash.cjs") }] },
+    ],
+    UserPromptSubmit: [{ hooks: [{ type: "command", command: hookCommand("user_prompt_submit.cjs") }] }],
+    SessionStart: [{ hooks: [{ type: "command", command: hookCommand("session_start.cjs") }] }],
+    Stop: [{ hooks: [{ type: "command", command: hookCommand("stop_flush.cjs") }] }],
+  };
+}
+
+function isOurs(hook) {
+  return typeof hook?.command === "string" && hook.command.replace(/\\/g, "/").includes("/.prompt-genie/hooks/");
+}
+
+// Add our hooks next to whatever the user already has. Earlier installs replaced
+// whole event lists, which deleted the user's own hooks; now we only remove our
+// previous entries (so reinstalling never duplicates them) and keep the rest.
 function wireHooks() {
   const settings = loadJson(SETTINGS_FILE);
   settings.hooks = settings.hooks || {};
-  settings.hooks.PreToolUse = [
-    { matcher: "Read", hooks: [{ type: "command", command: hookCommand("pre_read.cjs") }] },
-    { matcher: "Bash", hooks: [{ type: "command", command: hookCommand("pre_bash.cjs") }] },
-  ];
-  settings.hooks.PostToolUse = [
-    { matcher: "Read", hooks: [{ type: "command", command: hookCommand("post_read.cjs") }] },
-    { matcher: "Bash", hooks: [{ type: "command", command: hookCommand("post_bash.cjs") }] },
-  ];
-  settings.hooks.UserPromptSubmit = [
-    { hooks: [{ type: "command", command: hookCommand("user_prompt_submit.cjs") }] },
-  ];
-  settings.hooks.SessionStart = [
-    { hooks: [{ type: "command", command: hookCommand("session_start.cjs") }] },
-  ];
-  settings.hooks.Stop = [
-    { hooks: [{ type: "command", command: hookCommand("stop_flush.cjs") }] },
-  ];
+  for (const [event, groups] of Object.entries(ourHooks())) {
+    const existing = Array.isArray(settings.hooks[event]) ? settings.hooks[event] : [];
+    const kept = existing
+      .map((group) => ({ ...group, hooks: (group.hooks || []).filter((h) => !isOurs(h)) }))
+      .filter((group) => group.hooks.length > 0);
+    settings.hooks[event] = [...kept, ...groups];
+  }
   saveJson(SETTINGS_FILE, settings);
 }
 
@@ -222,7 +236,11 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error("Install failed:", err.message);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error("Install failed:", err.message);
+    process.exit(1);
+  });
+}
+
+module.exports = { wireHooks, isOurs };
