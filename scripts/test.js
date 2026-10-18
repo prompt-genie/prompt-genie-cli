@@ -26,6 +26,9 @@ const { publicKey: testPublicKey, privateKey: testPrivateKey } = crypto.generate
   privateKeyEncoding: { type: "pkcs8", format: "pem" },
 });
 process.env.PG_PUBLIC_KEY = testPublicKey;
+// Usage events are off for the hook tests; the "usage events" tests turn them on.
+process.env.PROMPT_GENIE_TELEMETRY = "0";
+delete process.env.DO_NOT_TRACK;
 
 function makeToken(plan) {
   const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
@@ -761,6 +764,113 @@ test("free: never uploads, resets counters, keeps the read memory", () => {
   assert(s.tokensSaved === 0 && Object.keys(s.files || {}).length === 1, "counters reset, memory kept");
 });
 
+// ── Usage events ──────────────────────────────────────────────────────────────
+
+console.log("\n  usage events");
+
+const eventsFile = path.join(claudeDir, "pg_events.json");
+const queued = () => { try { return JSON.parse(fs.readFileSync(eventsFile, "utf8")).events || []; } catch { return []; } };
+const bothOk = {
+  data: {
+    recordTokenSavings: JSON.stringify({ success: true, recorded: 1, duplicates: 0 }),
+    trackProductEvents: JSON.stringify({ success: true, accepted: 2, dropped: 0 }),
+  },
+};
+const trackRequests = () => fakeRequests().filter((r) => /trackProductEvents/.test(r.query));
+
+test("opted out (PROMPT_GENIE_TELEMETRY=0): nothing is queued", () => {
+  removeFile(eventsFile);
+  runHook("session_start.cjs", { hook_event_name: "SessionStart", session_id: SID, source: "startup" });
+  assert(!fs.existsSync(eventsFile), "no queue file when opted out");
+});
+
+process.env.PROMPT_GENIE_TELEMETRY = "1";
+
+test("session start queues cli_session_started; compact does not", () => {
+  removeFile(eventsFile);
+  runHook("session_start.cjs", { hook_event_name: "SessionStart", session_id: SID, source: "startup" });
+  runHook("session_start.cjs", { hook_event_name: "SessionStart", session_id: SID, source: "compact" });
+  const q = queued();
+  assert(q.length === 1, `expected 1 event, got ${q.length}`);
+  assert(q[0].event === "cli_session_started" && q[0].properties.source === "startup", "event and source");
+  assert(/^cli-[0-9a-f-]{36}$/.test(q[0].id), `id ${q[0].id}`);
+  assert(/^\d+\.\d+\.\d+/.test(q[0].properties.client_version), "carries the client version");
+});
+
+test("DO_NOT_TRACK=1 also opts out", () => {
+  removeFile(eventsFile);
+  process.env.DO_NOT_TRACK = "1";
+  runHook("session_start.cjs", { hook_event_name: "SessionStart", session_id: SID, source: "startup" });
+  delete process.env.DO_NOT_TRACK;
+  assert(queued().length === 0, "nothing queued");
+});
+
+test("paid: Stop sends queued events with the token and clears the queue", () => {
+  useFakeApi();
+  resetFake(bothOk);
+  clearSessions();
+  writePaidConfig();
+  removeFile(eventsFile);
+  runHook("session_start.cjs", { hook_event_name: "SessionStart", session_id: SID, source: "startup" });
+  writeSession(SID, sessionWithSavings());
+  runHook("stop_flush.cjs", { hook_event_name: "Stop", session_id: SID, cwd: "/work/shop-api" });
+  const reqs = trackRequests();
+  assert(reqs.length === 1, `expected 1 trackProductEvents request, got ${reqs.length}`);
+  const savedToken = JSON.parse(fs.readFileSync(path.join(claudeDir, "pg_config.json"), "utf8")).token;
+  assert(reqs[0].variables.token === savedToken, "sends the signed CLI token");
+  const events = JSON.parse(reqs[0].variables.events);
+  assert(events.map((e) => e.event).join(",") === "cli_session_started,cli_savings_recorded", `events ${events.map((e) => e.event)}`);
+  assert(events[1].properties.tokens_saved === 9000 && events[1].properties.hits === 4, "savings counts");
+  const raw = JSON.stringify(reqs[0].variables);
+  assert(!raw.includes("shop-api") && !raw.includes(testFile) && !raw.includes("test@example.com"), "no codebase, paths or email");
+  assert(queued().length === 0, "queue cleared after success");
+});
+
+test("events are kept when the backend doesn't have trackProductEvents yet", () => {
+  useFakeApi();
+  resetFake({ data: { recordTokenSavings: JSON.stringify({ success: true, recorded: 1, duplicates: 0 }) }, errors: [{ message: "FieldUndefined" }] });
+  clearSessions();
+  writePaidConfig();
+  removeFile(eventsFile);
+  writeSession(SID, sessionWithSavings());
+  runHook("stop_flush.cjs", { hook_event_name: "Stop", session_id: SID });
+  assert(trackRequests().length === 1, "tried once");
+  assert(queued().length === 1, "kept for a retry");
+});
+
+test("free: fresh events wait to be batched, then go out", () => {
+  useFakeApi();
+  resetFake(bothOk);
+  clearSessions();
+  writeClaudeFile("pg_config.json", { email: "test@example.com", plan: "FREE", token: makeToken("FREE") });
+  removeFile(eventsFile);
+  writeSession(SID, sessionWithSavings());
+  runHook("stop_flush.cjs", { hook_event_name: "Stop", session_id: SID });
+  assert(fakeRequests().length === 0, "no request for a fresh queue");
+  const q = queued();
+  assert(q.length === 1 && q[0].event === "cli_free_savings_shown" && q[0].properties.tokens_saved === 9000, "would-have-saved event queued");
+
+  const aged = q.map((e) => ({ ...e, timestamp: new Date(Date.now() - 11 * 60 * 1000).toISOString() }));
+  writeClaudeFile("pg_events.json", { events: aged });
+  runHook("stop_flush.cjs", { hook_event_name: "Stop", session_id: SID });
+  assert(trackRequests().length === 1, "sent once the queue is old enough");
+  assert(fakeRequests().every((r) => !/recordTokenSavings/.test(r.query)), "free plan still never uploads savings");
+  assert(queued().length === 0, "queue cleared");
+});
+
+test("events older than the server accepts are dropped locally", () => {
+  removeFile(eventsFile);
+  writeClaudeFile("pg_events.json", { events: [{ id: "cli-old-event-01", event: "cli_signed_in", timestamp: new Date(Date.now() - 8 * 86_400_000).toISOString(), properties: {} }] });
+  useFakeApi();
+  resetFake(bothOk);
+  clearSessions();
+  writePaidConfig();
+  runHook("stop_flush.cjs", { hook_event_name: "Stop", session_id: SID });
+  assert(trackRequests().length === 0, "nothing worth sending");
+});
+
+process.env.PROMPT_GENIE_TELEMETRY = "0";
+
 fakeServer.kill();
 delete process.env.PG_GRAPHQL_URL;
 fs.rmSync(fakeDir, { recursive: true, force: true });
@@ -797,6 +907,32 @@ test("keeps the user's own hooks and replaces only ours, idempotently", () => {
   assert(commands("Notification").includes("say done"), "user's other events kept");
   assert(commands("PreToolUse").filter((c) => c.includes("pre_read.cjs")).length === 1, "our pre_read hook present exactly once");
   assert(commands("Stop").filter((c) => c.includes("stop_flush.cjs")).length === 1, "our Stop hook present exactly once");
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("install queues cli_signed_in and cli_installed for the first Stop", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pg-install-"));
+  const r = spawnSync(process.execPath, ["-e", `require(${JSON.stringify(path.join(__dirname, "..", "bin", "install.cjs"))}).finishInstall("a@b.co", "PRO", "tok", { signedIn: true })`], {
+    env: { ...process.env, HOME: home, USERPROFILE: home, PROMPT_GENIE_TELEMETRY: "1" },
+    encoding: "utf8",
+  });
+  assert(r.status === 0, `install exited ${r.status}: ${r.stderr}`);
+  const events = JSON.parse(fs.readFileSync(path.join(home, ".claude", "pg_events.json"), "utf8")).events;
+  assert(events.map((e) => e.event).join(",") === "cli_signed_in,cli_installed", `events ${events.map((e) => e.event)}`);
+  assert(events[1].properties.reinstall === "no" && events[1].properties.agent === "claude_code", "install properties");
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("install keeps a telemetry opt-out in pg_config.json and queues nothing", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pg-install-"));
+  fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "pg_config.json"), JSON.stringify({ telemetry: false }));
+  spawnSync(process.execPath, ["-e", `require(${JSON.stringify(path.join(__dirname, "..", "bin", "install.cjs"))}).finishInstall("a@b.co", "PRO", "tok")`], {
+    env: { ...process.env, HOME: home, USERPROFILE: home, PROMPT_GENIE_TELEMETRY: "1" },
+    encoding: "utf8",
+  });
+  assert(JSON.parse(fs.readFileSync(path.join(home, ".claude", "pg_config.json"), "utf8")).telemetry === false, "opt-out kept");
+  assert(!fs.existsSync(path.join(home, ".claude", "pg_events.json")), "nothing queued");
   fs.rmSync(home, { recursive: true, force: true });
 });
 

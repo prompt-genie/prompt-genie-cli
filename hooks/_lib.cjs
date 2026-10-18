@@ -9,6 +9,9 @@ const CLAUDE_DIR   = path.join(process.env.HOME || os.homedir(), ".claude");
 const SESSIONS_DIR = path.join(CLAUDE_DIR, "pg_sessions");
 const STATS_FILE   = path.join(CLAUDE_DIR, "pg_stats.json");
 const CONFIG_FILE  = path.join(CLAUDE_DIR, "pg_config.json");
+const EVENTS_FILE  = path.join(CLAUDE_DIR, "pg_events.json");
+
+const CLI_VERSION = "0.6.0";
 
 const PUBLIC_KEY = process.env.PG_PUBLIC_KEY || `-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArjBMJfK6K8JnPvZR3kuS
@@ -185,6 +188,53 @@ function currentPlanIsPaid() {
   }
 }
 
+// ── Usage analytics ───────────────────────────────────────────────────────────
+
+// Hooks queue product events locally (no network on the hot path); stop_flush
+// sends them with the turn's savings upload. Events carry counts and labels
+// only: never prompts, file contents, paths or command text.
+const MAX_QUEUED_EVENTS = 200;
+const MAX_EVENT_AGE_MS = 6 * 86_400_000; // the server accepts 7 days
+
+// Off with PROMPT_GENIE_TELEMETRY=0, DO_NOT_TRACK=1 or "telemetry": false in pg_config.json.
+function telemetryEnabled() {
+  const flag = String(process.env.PROMPT_GENIE_TELEMETRY || "").toLowerCase();
+  if (flag === "0" || flag === "false" || flag === "off") return false;
+  if (process.env.DO_NOT_TRACK && process.env.DO_NOT_TRACK !== "0") return false;
+  return loadJson(CONFIG_FILE).telemetry !== false;
+}
+
+function queueEvent(event, properties = {}) {
+  try {
+    if (!telemetryEnabled()) return;
+    const queue = loadJson(EVENTS_FILE);
+    const events = Array.isArray(queue.events) ? queue.events : [];
+    events.push({
+      id: `cli-${crypto.randomUUID()}`,
+      event,
+      timestamp: new Date().toISOString(),
+      properties: { ...properties, client_version: CLI_VERSION },
+    });
+    saveJsonAtomic(EVENTS_FILE, { events: events.slice(-MAX_QUEUED_EVENTS) });
+  } catch { /* analytics must never break the session */ }
+}
+
+function queuedEvents() {
+  if (!telemetryEnabled()) return [];
+  const events = loadJson(EVENTS_FILE).events;
+  const cutoff = Date.now() - MAX_EVENT_AGE_MS;
+  return Array.isArray(events) ? events.filter((e) => Date.parse(e.timestamp) >= cutoff) : [];
+}
+
+// Re-read before writing so events queued by a concurrent hook are kept.
+function dropQueuedEvents(ids) {
+  const sent = new Set(ids);
+  const cutoff = Date.now() - MAX_EVENT_AGE_MS;
+  const events = loadJson(EVENTS_FILE).events;
+  const left = Array.isArray(events) ? events.filter((e) => !sent.has(e.id) && Date.parse(e.timestamp) >= cutoff) : [];
+  saveJsonAtomic(EVENTS_FILE, { events: left });
+}
+
 // ── stdin ─────────────────────────────────────────────────────────────────────
 
 // Resolves with the parsed hook event, or null on malformed/missing input.
@@ -206,11 +256,12 @@ function readStdinJson(timeoutMs = 2000) {
 }
 
 module.exports = {
-  CLAUDE_DIR, SESSIONS_DIR, STATS_FILE, CONFIG_FILE, PUBLIC_KEY,
+  CLAUDE_DIR, SESSIONS_DIR, STATS_FILE, CONFIG_FILE, EVENTS_FILE, PUBLIC_KEY, CLI_VERSION,
   loadJson, saveJsonAtomic, unlinkQuiet,
   sha1, estimateTokens, today, buildLineDelta,
   sessionFile, loadSession, saveSession, deleteSession, gcSessions, evictOldest,
   bumpStats,
   verifyJWT, decodeJWT, isPaidPlan, currentPlanIsPaid,
+  telemetryEnabled, queueEvent, queuedEvents, dropQueuedEvents,
   readStdinJson,
 };

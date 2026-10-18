@@ -10,6 +10,10 @@ async function main() {
   const data = await lib.readStdinJson();
   if (!data || data.hook_event_name !== "SessionStart") process.exit(0);
 
+  if (data.source === "startup" || data.source === "resume") {
+    lib.queueEvent("cli_session_started", { source: data.source });
+  }
+
   if (data.source !== "compact" && data.source !== "clear") process.exit(0);
 
   const session = lib.loadSession(data.session_id);

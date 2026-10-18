@@ -96,6 +96,26 @@ The hooks store only content hashes and aggregate counters locally under
 the project folder name) are sent to your dashboard. File contents and command
 outputs never leave your machine.
 
+### Usage events
+
+To understand how Prompt Genie is used, the hooks also send a few usage events
+linked to your account: install and sign-in, session starts, and per-turn token
+counts (tokens saved, hits, misses). They carry no prompts, code, file paths,
+command text or project names. Events are queued in `~/.claude/pg_events.json`
+and sent at the end of a turn.
+
+To turn them off, set either environment variable:
+
+```bash
+export PROMPT_GENIE_TELEMETRY=0
+```
+
+```bash
+export DO_NOT_TRACK=1
+```
+
+or add `"telemetry": false` to `~/.claude/pg_config.json`.
+
 ---
 
 MIT © Prompt Genie
