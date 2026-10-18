@@ -7,10 +7,10 @@ const crypto = require("crypto");
 const lib = require("./_lib.cjs");
 
 // Runs when Claude finishes a turn. Uploads the savings counted since the last
-// upload and resets those counters. The session's memory of what Claude already
-// read is kept, so re-reads in later turns of the same session still hit.
+// upload and resets those counters, then sends any queued usage events. The
+// session's memory of what Claude already read is kept, so re-reads in later
+// turns of the same session still hit.
 
-const CLI_VERSION = "0.5.0";
 const GRAPHQL_URL = process.env.PG_GRAPHQL_URL || "https://ouybbvbacjd3tbbvf3jpqbiizy.appsync-api.us-east-2.amazonaws.com/graphql";
 const API_KEY     = process.env.PG_API_KEY || "da2-xj6noinlgffx3ms3lgeopbhrjq";
 const REQUEST_TIMEOUT_MS = 8000;
@@ -18,6 +18,7 @@ const MAX_PENDING_DAYS = 25;
 // Server answers that mean "try again later"; anything else means the batch
 // itself was rejected and resending it can never succeed.
 const RETRYABLE_ERRORS = new Set(["Unauthorized", "Write failed", "Internal error"]);
+const RETRYABLE_EVENT_ERRORS = new Set(["Unauthorized", "Internal error", "Analytics unavailable", "Analytics not configured"]);
 
 function gqlPost(query, variables) {
   return new Promise((resolve, reject) => {
@@ -83,7 +84,7 @@ function stagePendingUpload(session, codebase) {
     misses,
     tokensSaved,
     codebase,
-    clientVersion: CLI_VERSION,
+    clientVersion: lib.CLI_VERSION,
   });
   // The server only accepts recent dates, so drop uploads that sat unsent for
   // weeks, and cap how many we keep while offline.
@@ -92,6 +93,30 @@ function stagePendingUpload(session, codebase) {
   session.hits = 0;
   session.misses = 0;
   session.tokensSaved = 0;
+}
+
+// Sends queued usage events. They are kept for a retry when the request fails
+// or the server can't take them right now (including a backend that doesn't
+// have trackProductEvents yet, which answers with GraphQL errors). Unless the
+// turn already went to the network, wait until the queue is a few minutes old
+// so free users don't make a request on every turn.
+const EVENT_BATCH_WAIT_MS = 10 * 60 * 1000;
+async function flushEvents(token, { force = false } = {}) {
+  const events = lib.queuedEvents().slice(0, 50);
+  if (!events.length) return;
+  const oldest = Math.min(...events.map((e) => Date.parse(e.timestamp)));
+  if (!force && events.length < 20 && Date.now() - oldest < EVENT_BATCH_WAIT_MS) return;
+  try {
+    const res = await gqlPost(
+      `mutation Track($token: String!, $events: String!) { trackProductEvents(token: $token, events: $events) }`,
+      { token, events: JSON.stringify(events) }
+    );
+    if (!res.data?.trackProductEvents) return;
+    const result = JSON.parse(res.data.trackProductEvents);
+    if (result.success || (result.error && !RETRYABLE_EVENT_ERRORS.has(result.error))) {
+      lib.dropQueuedEvents(events.map((e) => e.id));
+    }
+  } catch { /* offline: events are retried at the next Stop */ }
 }
 
 async function main() {
@@ -111,7 +136,8 @@ async function main() {
   const misses = session.misses || 0;
   const tokensSaved = session.tokensSaved || 0;
   const hasPending = (session.pendingUploads || []).length > 0;
-  if (hits === 0 && misses === 0 && !hasPending) process.exit(0);
+  const hasEvents = lib.queuedEvents().length > 0;
+  if (hits === 0 && misses === 0 && !hasPending && !hasEvents) process.exit(0);
 
   const token = config.token;
   if (!token) process.exit(0);
@@ -131,6 +157,7 @@ async function main() {
   // FREE plan: show what memory would have saved, then start counting afresh.
   if (!lib.isPaidPlan(plan)) {
     if (tokensSaved > 0) {
+      lib.queueEvent("cli_free_savings_shown", { tokens_saved: tokensSaved, hits, misses });
       process.stderr.write(
         `\n  Prompt Genie: Context Memory paused\n` +
         `  Claude re-read ~${tokensSaved.toLocaleString()} tokens worth of context this turn.\n` +
@@ -142,29 +169,33 @@ async function main() {
     session.tokensSaved = 0;
     session.pendingUploads = [];
     lib.saveSession(sessionId, session);
+    await flushEvents(liveToken);
     process.exit(0);
   }
 
   // PRO/TEAMS: upload. The server takes the account from the signed token, so
   // the request carries no email.
+  if (hits > 0 || misses > 0) lib.queueEvent("cli_savings_recorded", { hits, misses, tokens_saved: tokensSaved });
   stagePendingUpload(session, path.basename(event.cwd || process.cwd()));
   lib.saveSession(sessionId, session);
-  if (!session.pendingUploads.length) process.exit(0);
 
-  try {
-    const res = await gqlPost(
-      `mutation Record($token: String!, $entries: String!) { recordTokenSavings(token: $token, entries: $entries) }`,
-      { token: liveToken, entries: JSON.stringify(session.pendingUploads) }
-    );
-    const result = JSON.parse(res.data?.recordTokenSavings || "{}");
-    if (result.success || (result.error && !RETRYABLE_ERRORS.has(result.error))) {
-      const latest = lib.loadSession(sessionId);
-      const sentIds = new Set(session.pendingUploads.map((p) => p.id));
-      latest.pendingUploads = (latest.pendingUploads || []).filter((p) => !sentIds.has(p.id));
-      lib.saveSession(sessionId, latest);
-    }
-  } catch { /* offline: pending uploads are retried at the next Stop */ }
+  if (session.pendingUploads.length) {
+    try {
+      const res = await gqlPost(
+        `mutation Record($token: String!, $entries: String!) { recordTokenSavings(token: $token, entries: $entries) }`,
+        { token: liveToken, entries: JSON.stringify(session.pendingUploads) }
+      );
+      const result = JSON.parse(res.data?.recordTokenSavings || "{}");
+      if (result.success || (result.error && !RETRYABLE_ERRORS.has(result.error))) {
+        const latest = lib.loadSession(sessionId);
+        const sentIds = new Set(session.pendingUploads.map((p) => p.id));
+        latest.pendingUploads = (latest.pendingUploads || []).filter((p) => !sentIds.has(p.id));
+        lib.saveSession(sessionId, latest);
+      }
+    } catch { /* offline: pending uploads are retried at the next Stop */ }
+  }
 
+  await flushEvents(liveToken, { force: session.pendingUploads.length > 0 });
   process.exit(0);
 }
 

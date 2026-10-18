@@ -9,6 +9,8 @@ const crypto = require("crypto");
 const HOOKS_DEST    = path.join(os.homedir(), ".prompt-genie", "hooks");
 const SETTINGS_FILE = path.join(os.homedir(), ".claude", "settings.json");
 const CONFIG_FILE   = path.join(os.homedir(), ".claude", "pg_config.json");
+const EVENTS_FILE   = path.join(os.homedir(), ".claude", "pg_events.json");
+const VERSION       = require("../package.json").version;
 const HOOKS_SRC     = path.join(__dirname, "..", "dist", "hooks");
 
 const GRAPHQL_URL = "https://ouybbvbacjd3tbbvf3jpqbiizy.appsync-api.us-east-2.amazonaws.com/graphql";
@@ -131,10 +133,43 @@ function wireHooks() {
   saveJson(SETTINGS_FILE, settings);
 }
 
-function finishInstall(email, plan, token) {
+// Queue install events for the hooks to send at the end of the first turn
+// (same queue and opt-outs as hooks/_lib.cjs; nothing is sent from here).
+function queueInstallEvents(events) {
+  try {
+    const flag = String(process.env.PROMPT_GENIE_TELEMETRY || "").toLowerCase();
+    if (flag === "0" || flag === "false" || flag === "off") return;
+    if (process.env.DO_NOT_TRACK && process.env.DO_NOT_TRACK !== "0") return;
+    if (loadJson(CONFIG_FILE).telemetry === false) return;
+    const queue = loadJson(EVENTS_FILE);
+    const list = Array.isArray(queue.events) ? queue.events : [];
+    for (const [event, properties] of events) {
+      list.push({
+        id: `cli-${crypto.randomUUID()}`,
+        event,
+        timestamp: new Date().toISOString(),
+        properties: { ...properties, client_version: VERSION },
+      });
+    }
+    saveJson(EVENTS_FILE, { events: list.slice(-200) });
+  } catch { /* never fail an install over analytics */ }
+}
+
+function finishInstall(email, plan, token, { signedIn = false } = {}) {
+  const reinstall = fs.existsSync(path.join(HOOKS_DEST, "stop_flush.cjs"));
   copyHooks();
   wireHooks();
-  saveJson(CONFIG_FILE, { email, plan, token });
+  const telemetry = loadJson(CONFIG_FILE).telemetry;
+  saveJson(CONFIG_FILE, telemetry === false ? { email, plan, token, telemetry } : { email, plan, token });
+  queueInstallEvents([
+    ...(signedIn ? [["cli_signed_in", {}]] : []),
+    ["cli_installed", {
+      agent: "claude_code",
+      os: process.platform,
+      node_major: Number(process.versions.node.split(".")[0]),
+      reinstall: reinstall ? "yes" : "no",
+    }],
+  ]);
 
   const isPaid = ["PRO", "ANNUAL_PRO", "THREE_DAY_PASS", "TEAMS", "ENTERPRISE", "LIFETIME"].includes(plan);
   if (isPaid) {
@@ -147,6 +182,9 @@ function finishInstall(email, plan, token) {
 
   Restart VS Code to activate, then start a session as normal.
   Your context savings will appear at prompt-genie.com/dashboard.
+
+  Prompt Genie sends usage events linked to your account (session starts
+  and token counts, never your code or prompts). Opt out: PROMPT_GENIE_TELEMETRY=0
 `);
   } else {
     console.log(`
@@ -157,6 +195,9 @@ function finishInstall(email, plan, token) {
   you would have saved.
 
   Activate context memory -> prompt-genie.com/pricing
+
+  Prompt Genie sends usage events linked to your account (session starts
+  and token counts, never your code or prompts). Opt out: PROMPT_GENIE_TELEMETRY=0
 `);
   }
 }
@@ -229,7 +270,7 @@ async function main() {
       console.error("  " + (result.error || "Verification failed. Try again."));
       process.exit(1);
     }
-    finishInstall(email, result.plan, result.token);
+    finishInstall(email, result.plan, result.token, { signedIn: true });
   } catch (err) {
     console.error("  Network error:", err.message);
     process.exit(1);
@@ -243,4 +284,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { wireHooks, isOurs };
+module.exports = { wireHooks, isOurs, finishInstall };
