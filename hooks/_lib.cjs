@@ -11,7 +11,7 @@ const STATS_FILE   = path.join(CLAUDE_DIR, "pg_stats.json");
 const CONFIG_FILE  = path.join(CLAUDE_DIR, "pg_config.json");
 const EVENTS_FILE  = path.join(CLAUDE_DIR, "pg_events.json");
 
-const CLI_VERSION = "0.6.0";
+const CLI_VERSION = "0.6.1";
 
 const PUBLIC_KEY = process.env.PG_PUBLIC_KEY || `-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArjBMJfK6K8JnPvZR3kuS

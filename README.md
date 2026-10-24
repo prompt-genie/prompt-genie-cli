@@ -116,6 +116,17 @@ export DO_NOT_TRACK=1
 
 or add `"telemetry": false` to `~/.claude/pg_config.json`.
 
+### Automatic updates
+
+Once a day, at the start of a Claude Code session, Prompt Genie checks npm for a
+newer release in the background (the session never waits on it). A new release
+is downloaded from registry.npmjs.org, checked against npm's published sha512
+checksum, and swapped in for the hooks in `~/.prompt-genie/hooks`. Your settings
+and stats are kept.
+
+To turn it off, set `PROMPT_GENIE_AUTO_UPDATE=0`, or add `"autoUpdate": false`
+to `~/.claude/pg_config.json`. You can always update by hand with `npx prompt-genie`.
+
 ---
 
 MIT © Prompt Genie
