@@ -936,6 +936,174 @@ test("install keeps a telemetry opt-out in pg_config.json and queues nothing", (
   fs.rmSync(home, { recursive: true, force: true });
 });
 
+// ── Self-update ───────────────────────────────────────────────────────────────
+
+console.log("\n  self update");
+
+// Minimal ustar writer, the format npm publishes.
+function makeTar(entries) {
+  const blocks = [];
+  for (const [name, body] of entries) {
+    const h = Buffer.alloc(512);
+    h.write(name, 0, 100, "utf8");
+    h.write("0000644\0", 100); h.write("0000000\0", 108); h.write("0000000\0", 116);
+    h.write(body.length.toString(8).padStart(11, "0") + "\0", 124);
+    h.write("00000000000\0", 136);
+    h.write("0", 156);
+    h.write("ustar\0", 257); h.write("00", 263);
+    h.fill(" ", 148, 156);
+    let sum = 0; for (const b of h) sum += b;
+    h.write(sum.toString(8).padStart(6, "0") + "\0 ", 148);
+    blocks.push(h, body, Buffer.alloc((512 - (body.length % 512)) % 512));
+  }
+  blocks.push(Buffer.alloc(1024));
+  return Buffer.concat(blocks);
+}
+
+const regDir = fs.mkdtempSync(path.join(os.tmpdir(), "pg-registry-"));
+const registry = require("child_process").spawn(process.execPath, ["-e", `
+  const http = require("http"), fs = require("fs"), dir = process.argv[1];
+  const srv = http.createServer((req, res) => {
+    fs.appendFileSync(dir + "/requests.log", req.url + "\\n");
+    const file = req.url === "/prompt-genie/latest" ? "latest.json" : req.url.slice(1);
+    try { res.end(fs.readFileSync(dir + "/" + file)); } catch { res.statusCode = 404; res.end(); }
+  });
+  srv.listen(0, "127.0.0.1", () => fs.writeFileSync(dir + "/port", String(srv.address().port)));
+`, regDir], { stdio: "ignore" });
+for (let i = 0; i < 100 && !fs.existsSync(path.join(regDir, "port")); i++) sleep(50);
+const regUrl = `http://127.0.0.1:${fs.readFileSync(path.join(regDir, "port"), "utf8")}`;
+
+// Publish a fake release: today's built hooks with a marker appended.
+function publish(version, { corrupt = false, dropFile = null } = {}) {
+  const entries = [];
+  for (const f of fs.readdirSync(HOOKS_DIR)) {
+    if (!f.endsWith(".cjs") || f === dropFile) continue;
+    entries.push([`package/dist/hooks/${f}`, Buffer.concat([fs.readFileSync(path.join(HOOKS_DIR, f)), Buffer.from(`\n// release ${version}\n`)])]);
+  }
+  entries.push(["package/bin/install.cjs", fs.readFileSync(path.join(__dirname, "..", "bin", "install.cjs"))]);
+  entries.push(["package/package.json", Buffer.from(JSON.stringify({ name: "prompt-genie", version }))]);
+  const tgz = require("zlib").gzipSync(makeTar(entries));
+  const integrity = "sha512-" + crypto.createHash("sha512").update(corrupt ? Buffer.from("tampered") : tgz).digest("base64");
+  fs.writeFileSync(path.join(regDir, "pkg.tgz"), tgz);
+  fs.writeFileSync(path.join(regDir, "latest.json"), JSON.stringify({ name: "prompt-genie", version, dist: { tarball: `${regUrl}/pkg.tgz`, integrity } }));
+  removeFile(path.join(regDir, "requests.log"));
+}
+
+// A fresh install of the current hooks under a throwaway home.
+function freshInstall() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pg-home-"));
+  const hooksDir = path.join(home, ".prompt-genie", "hooks");
+  fs.mkdirSync(hooksDir, { recursive: true });
+  fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+  for (const f of fs.readdirSync(HOOKS_DIR)) fs.copyFileSync(path.join(HOOKS_DIR, f), path.join(hooksDir, f));
+  return { home, hooksDir };
+}
+const runUpdater = (home, env = {}) => spawnSync(process.execPath, [path.join(home, ".prompt-genie", "hooks", "self_update.cjs")], {
+  env: { ...process.env, HOME: home, USERPROFILE: home, PG_REGISTRY_URL: regUrl, PROMPT_GENIE_TELEMETRY: "1", ...env },
+  encoding: "utf8", timeout: 20000,
+});
+const libMarker = (hooksDir) => fs.readFileSync(path.join(hooksDir, "_lib.cjs"), "utf8").match(/\/\/ release (\S+)/)?.[1] || null;
+const updateState = (home) => { try { return JSON.parse(fs.readFileSync(path.join(home, ".claude", "pg_update.json"), "utf8")); } catch { return {}; } };
+const registryHits = () => { try { return fs.readFileSync(path.join(regDir, "requests.log"), "utf8").trim().split("\n").filter(Boolean); } catch { return []; } };
+
+test("installs a newer verified release and records it", () => {
+  publish("9.9.9");
+  const { home, hooksDir } = freshInstall();
+  const r = runUpdater(home);
+  assert(r.status === 0, `exit ${r.status}: ${r.stderr}`);
+  assert(libMarker(hooksDir) === "9.9.9", "hooks replaced with the new release");
+  assert(libMarker(hooksDir) && fs.readdirSync(hooksDir).every((f) => !f.includes(".update-")), "no temp files left");
+  const st = updateState(home);
+  assert(st.version === "9.9.9" && typeof st.checkedAt === "number", `state ${JSON.stringify(st)}`);
+  const settings = JSON.parse(fs.readFileSync(path.join(home, ".claude", "settings.json"), "utf8"));
+  assert((settings.hooks.Stop || []).some((g) => g.hooks.some((h) => h.command.includes("stop_flush.cjs"))), "hooks re-wired in settings.json");
+  const events = JSON.parse(fs.readFileSync(path.join(home, ".claude", "pg_events.json"), "utf8")).events;
+  assert(events.some((e) => e.event === "cli_updated" && e.properties.to_version === "9.9.9"), "cli_updated queued");
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("checks at most once a day", () => {
+  publish("9.9.9");
+  const { home, hooksDir } = freshInstall();
+  fs.writeFileSync(path.join(home, ".claude", "pg_update.json"), JSON.stringify({ checkedAt: Date.now() - 60 * 60 * 1000 }));
+  runUpdater(home);
+  assert(registryHits().length === 0, "no registry call within 24h");
+  assert(libMarker(hooksDir) === null, "hooks untouched");
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("does nothing when the registry has no newer version", () => {
+  publish("0.0.1");
+  const { home, hooksDir } = freshInstall();
+  runUpdater(home);
+  assert(registryHits().length === 1, `only the version check, got ${registryHits()}`);
+  assert(libMarker(hooksDir) === null, "hooks untouched");
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("rejects a tarball that fails the integrity check", () => {
+  publish("9.9.9", { corrupt: true });
+  const { home, hooksDir } = freshInstall();
+  runUpdater(home);
+  assert(libMarker(hooksDir) === null, "hooks untouched");
+  assert(/integrity/.test(updateState(home).lastError || ""), `lastError ${updateState(home).lastError}`);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("rejects a release missing core hooks", () => {
+  publish("9.9.9", { dropFile: "stop_flush.cjs" });
+  const { home, hooksDir } = freshInstall();
+  runUpdater(home);
+  assert(libMarker(hooksDir) === null, "hooks untouched");
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("PROMPT_GENIE_AUTO_UPDATE=0 and autoUpdate:false turn it off", () => {
+  publish("9.9.9");
+  const a = freshInstall();
+  runUpdater(a.home, { PROMPT_GENIE_AUTO_UPDATE: "0" });
+  const b = freshInstall();
+  fs.writeFileSync(path.join(b.home, ".claude", "pg_config.json"), JSON.stringify({ autoUpdate: false }));
+  runUpdater(b.home);
+  assert(registryHits().length === 0, "no registry call when opted out");
+  assert(libMarker(a.hooksDir) === null && libMarker(b.hooksDir) === null, "hooks untouched");
+  fs.rmSync(a.home, { recursive: true, force: true });
+  fs.rmSync(b.home, { recursive: true, force: true });
+});
+
+test("session start launches the update in the background without waiting", () => {
+  publish("9.9.9");
+  const { home, hooksDir } = freshInstall();
+  const started = Date.now();
+  const r = spawnSync(process.execPath, [path.join(hooksDir, "session_start.cjs")], {
+    input: JSON.stringify({ hook_event_name: "SessionStart", session_id: SID, source: "startup" }),
+    env: { ...process.env, HOME: home, USERPROFILE: home, PG_REGISTRY_URL: regUrl },
+    encoding: "utf8", timeout: 6000,
+  });
+  assert(r.status === 0, `exit ${r.status}: ${r.stderr}`);
+  assert(Date.now() - started < 3000, "session start must not wait for the update");
+  for (let i = 0; i < 100 && libMarker(hooksDir) !== "9.9.9"; i++) sleep(100);
+  assert(libMarker(hooksDir) === "9.9.9", "background update completed");
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("hooks run from a checkout never self-update", () => {
+  publish("9.9.9");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pg-home-"));
+  fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+  spawnSync(process.execPath, [path.join(HOOKS_DIR, "session_start.cjs")], {
+    input: JSON.stringify({ hook_event_name: "SessionStart", session_id: SID, source: "startup" }),
+    env: { ...process.env, HOME: home, USERPROFILE: home, PG_REGISTRY_URL: regUrl },
+    encoding: "utf8", timeout: 6000,
+  });
+  sleep(500);
+  assert(registryHits().length === 0, "no registry call from a checkout");
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+registry.kill();
+fs.rmSync(regDir, { recursive: true, force: true });
+
 // ── Summary ───────────────────────────────────────────────────────────────────
 
 fs.rmSync(tmpHome, { recursive: true, force: true });
