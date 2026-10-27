@@ -11,7 +11,7 @@ const STATS_FILE   = path.join(CLAUDE_DIR, "pg_stats.json");
 const CONFIG_FILE  = path.join(CLAUDE_DIR, "pg_config.json");
 const EVENTS_FILE  = path.join(CLAUDE_DIR, "pg_events.json");
 
-const CLI_VERSION = "0.6.1";
+const CLI_VERSION = "0.6.2";
 
 const PUBLIC_KEY = process.env.PG_PUBLIC_KEY || `-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArjBMJfK6K8JnPvZR3kuS
@@ -94,6 +94,94 @@ function buildLineDelta(prevText, currText, kind) {
   // Only worth it if the delta is comfortably smaller than the full content.
   if (noteTokens >= Math.floor(fullTokens * 0.6)) return null;
   return { note, savedTokens: Math.max(0, fullTokens - noteTokens) };
+}
+
+// ── Line memory ───────────────────────────────────────────────────────────────
+
+// What the model was shown of each file, line by line, from Read or from shell
+// reads like `sed -n`. Lets a read of any range be answered from earlier reads
+// of other ranges. An entry is only trusted while the file's mtime is the one
+// it was recorded under; any edit on disk starts the file afresh.
+const MAX_LINE_FILES = 60;
+const MAX_LINES_PER_FILE = 20000;
+const MIN_COVERAGE_SAVING = 20; // tokens; below this the note isn't worth it
+const MAX_KNOWN_RANGES = 8;     // a note listing more fragments than this gets confusing
+
+function lineHash(line) {
+  return crypto.createHash("sha1").update(line).digest("hex").slice(0, 10);
+}
+
+function fileMtime(filePath) {
+  try { return fs.statSync(filePath).mtimeMs; } catch { return null; }
+}
+
+// The line hashes recorded for this file, or null if none or the file changed since
+function seenLines(session, filePath, mtime) {
+  const entry = session.lines && session.lines[filePath];
+  if (!entry || mtime == null || entry.mtime !== mtime) return null;
+  return entry.h;
+}
+
+// Record that lines start.. (1-based) of filePath are now in the model's context
+function rememberLines(session, filePath, mtime, start, lines) {
+  if (mtime == null || !(start >= 1) || !lines.length) return;
+  if (start - 1 + lines.length > MAX_LINES_PER_FILE) return;
+  const all = session.lines || (session.lines = {});
+  let entry = all[filePath];
+  if (!entry || entry.mtime !== mtime) entry = all[filePath] = { mtime, h: [] };
+  for (let i = 0; i < lines.length; i++) entry.h[start - 1 + i] = lineHash(lines[i]);
+  entry.ts = Date.now();
+  evictOldest(all, MAX_LINE_FILES);
+}
+
+// [[from, to], ...] runs of line numbers where covered[i] === want
+function lineRuns(covered, start, want) {
+  const runs = [];
+  for (let i = 0; i < covered.length; i++) {
+    if (covered[i] !== want) continue;
+    const last = runs[runs.length - 1];
+    if (last && last[1] === start + i - 1) last[1] = start + i;
+    else runs.push([start + i, start + i]);
+  }
+  return runs;
+}
+
+function formatRuns(runs) {
+  return runs.map(([a, b]) => (a === b ? `${a}` : `${a}-${b}`)).join(", ");
+}
+
+// Compare a read of lines start.. against what the model was already shown.
+// Fully seen: a short pointer back to the earlier output. Mostly seen: only the
+// unseen lines, numbered, plus which ranges to take from context. Returns
+// { note, savedTokens, full } or null when it isn't worth replacing.
+function buildCoverageNote(seen, start, lines, label) {
+  if (!seen || !lines.length) return null;
+  const covered = lines.map((line, i) => seen[start - 1 + i] === lineHash(line));
+  const nCovered = covered.filter(Boolean).length;
+  if (nCovered === 0) return null;
+
+  const end = start + lines.length - 1;
+  const full = nCovered === lines.length;
+  let note;
+  if (full) {
+    note =
+      `[Already in context: lines ${start}-${end} of ${label} are unchanged since you were ` +
+      `shown them earlier this session. Refer to that earlier output.]`;
+  } else {
+    if (nCovered * 2 < lines.length) return null;
+    const known = lineRuns(covered, start, true);
+    if (known.length > MAX_KNOWN_RANGES) return null;
+    const fresh = [];
+    for (let i = 0; i < lines.length; i++) if (!covered[i]) fresh.push(`${start + i}\t${lines[i]}`);
+    note =
+      `[Prompt Genie] Lines ${formatRuns(known)} of ${label} are already in your context, unchanged ` +
+      `since you were shown them earlier this session. Only the other lines of ${start}-${end} ` +
+      `are shown below (line number, tab, content):\n` + fresh.join("\n");
+  }
+
+  const savedTokens = estimateTokens(lines.join("\n")) - estimateTokens(note);
+  if (savedTokens < MIN_COVERAGE_SAVING) return null;
+  return { note, savedTokens, full };
 }
 
 // ── Per-session state ─────────────────────────────────────────────────────────
@@ -259,6 +347,7 @@ module.exports = {
   CLAUDE_DIR, SESSIONS_DIR, STATS_FILE, CONFIG_FILE, EVENTS_FILE, PUBLIC_KEY, CLI_VERSION,
   loadJson, saveJsonAtomic, unlinkQuiet,
   sha1, estimateTokens, today, buildLineDelta,
+  fileMtime, seenLines, rememberLines, buildCoverageNote,
   sessionFile, loadSession, saveSession, deleteSession, gcSessions, evictOldest,
   bumpStats,
   verifyJWT, decodeJWT, isPaidPlan, currentPlanIsPaid,

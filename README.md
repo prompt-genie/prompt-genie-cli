@@ -45,8 +45,10 @@ are no stale caches and no TTLs to tune.
   windows never interfere with each other.
 - **Compaction-aware.** After `/compact` or `/clear`, the memory resets because
   the files are no longer in context.
-- **Range-aware.** Partial reads of large files are tracked independently of
-  full reads.
+- **Line-aware.** Every line Claude has been shown is remembered, so a read of
+  a range it has mostly seen sends only the new lines, and a fully seen range is
+  a short note. Plain shell reads (`cat`, `sed -n 'A,Bp'`, `head -n N`) share the
+  same memory as the Read tool. Any change to the file on disk resets it.
 - **Local-only.** Fingerprints (hashes) are stored on your machine. File
   contents are never stored or transmitted.
 
