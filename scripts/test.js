@@ -364,6 +364,13 @@ const bigLines = Array.from({ length: 300 }, (_, i) => `const line${i} = ${i}; /
 const bigFile = bigLines.join("\n") + "\n";
 const editedFile = bigLines.map((l, i) => (i === 150 ? `const line150 = 999; // CHANGED` : l)).join("\n") + "\n";
 
+// An edit always moves the file's mtime; without it, line memory would answer first.
+let editClock = Date.now();
+function simulateEdit(fp) {
+  editClock += 5000;
+  fs.utimesSync(fp, new Date(editClock), new Date(editClock));
+}
+
 test("first large read stores text for diffing", () => {
   clearSessions();
   const r = runHook("post_read.cjs", postReadEvent(testFile, bigFile));
@@ -373,6 +380,7 @@ test("first large read stores text for diffing", () => {
 });
 
 test("re-read after a small edit: serves a delta, not the whole file", () => {
+  simulateEdit(testFile);
   const r = runHook("post_read.cjs", postReadEvent(testFile, editedFile));
   expectSuppression(r, "edited re-read");
   const out = parseJSON(r.stdout);
@@ -388,6 +396,7 @@ test("re-read after a small edit: serves a delta, not the whole file", () => {
 
 test("delta advances the stored copy (second small edit also deltas)", () => {
   const edited2 = bigLines.map((l, i) => (i === 150 ? `const line150 = 12345; // CHANGED AGAIN` : l)).join("\n") + "\n";
+  simulateEdit(testFile);
   const r = runHook("post_read.cjs", postReadEvent(testFile, edited2));
   expectSuppression(r, "second edited re-read");
   assert(parseJSON(r.stdout).hookSpecificOutput.updatedToolOutput.includes("12345"), "second delta must reflect newest change");
@@ -397,6 +406,7 @@ test("wholesale rewrite is too big to delta: passes through", () => {
   clearSessions();
   runHook("post_read.cjs", postReadEvent(testFile, bigFile));
   const rewritten = Array.from({ length: 300 }, (_, i) => `totally different content row ${i} ${"x".repeat(20)}`).join("\n") + "\n";
+  simulateEdit(testFile);
   const r = runHook("post_read.cjs", postReadEvent(testFile, rewritten));
   expectPassThrough(r, "wholesale rewrite");
   assert(readSession(SID).misses >= 1, "wholesale change should count as a miss");
@@ -406,11 +416,128 @@ test("free plan: delta is measured but NOT served", () => {
   writeFreeConfig();
   clearSessions();
   runHook("post_read.cjs", postReadEvent(testFile, bigFile));
+  simulateEdit(testFile);
   const r = runHook("post_read.cjs", postReadEvent(testFile, editedFile));
   expectPassThrough(r, "free delta must not be served");
   const session = readSession(SID);
   assert(session.hits >= 1 && session.tokensSaved > 0, "free plan must still measure the delta saving");
   writePaidConfig(); // restore
+});
+
+// ── line memory (range reads and shell reads) ───────────────────────────────────
+
+console.log("\n  line memory");
+
+const lmFile  = path.join(tmpHome, "lines.ts");
+const lmLines = Array.from({ length: 300 }, (_, i) => `export const value${i} = ${i} * 2; // line ${i + 1}`);
+fs.writeFileSync(lmFile, lmLines.join("\n") + "\n");
+
+// A Read of lines from..to (1-based, inclusive), shaped like Claude Code's response
+const rangeReadEvent = (fp, lines, from, to, sessionId = SID) => {
+  const slice = lines.slice(from - 1, to);
+  return {
+    hook_event_name: "PostToolUse",
+    tool_name: "Read",
+    session_id: sessionId,
+    cwd: tmpHome,
+    tool_input: from === 1 && to === lines.length
+      ? { file_path: fp }
+      : { file_path: fp, offset: from, limit: to - from + 1 },
+    tool_response: {
+      type: "text",
+      file: { filePath: fp, content: slice.join("\n"), numLines: slice.length, startLine: from, totalLines: lines.length },
+    },
+  };
+};
+const shownLines = (from, to) => lmLines.slice(from - 1, to).join("\n") + "\n";
+const noteOf = (r) => parseJSON(r.stdout)?.hookSpecificOutput?.updatedToolOutput || "";
+
+test("sub-range read after a full read is served from line memory", () => {
+  writePaidConfig();
+  clearSessions();
+  expectPassThrough(runHook("post_read.cjs", rangeReadEvent(lmFile, lmLines, 1, 300)), "full read");
+  const r = runHook("post_read.cjs", rangeReadEvent(lmFile, lmLines, 50, 150));
+  expectSuppression(r, "sub-range read");
+  assert(noteOf(r).includes("lines 50-150"), `note should name the range: ${noteOf(r).slice(0, 120)}`);
+  const session = readSession(SID);
+  assert(session.hits === 1 && session.tokensSaved > 0, "coverage hit not counted");
+});
+
+test("growing a range sends only the lines not yet seen", () => {
+  clearSessions();
+  runHook("post_read.cjs", rangeReadEvent(lmFile, lmLines, 1, 100));
+  const r = runHook("post_read.cjs", rangeReadEvent(lmFile, lmLines, 1, 200));
+  expectSuppression(r, "grown range");
+  const note = noteOf(r);
+  assert(note.includes("Lines 1-100"), "note should say which lines are already known");
+  assert(note.includes(`101\t${lmLines[100]}`), "unseen line 101 must be included, numbered");
+  assert(note.includes(`200\t${lmLines[199]}`), "unseen line 200 must be included");
+  assert(!note.includes(lmLines[10]), "already-seen line 11 must not be resent");
+});
+
+test("a mostly unseen range passes through whole", () => {
+  clearSessions();
+  runHook("post_read.cjs", rangeReadEvent(lmFile, lmLines, 1, 50));
+  expectPassThrough(runHook("post_read.cjs", rangeReadEvent(lmFile, lmLines, 1, 200)), "mostly new range");
+});
+
+test("file changed on disk: earlier lines are not trusted", () => {
+  clearSessions();
+  runHook("post_read.cjs", rangeReadEvent(lmFile, lmLines, 1, 300));
+  const later = new Date(Date.now() + 60_000);
+  fs.utimesSync(lmFile, later, later);
+  expectPassThrough(runHook("post_read.cjs", rangeReadEvent(lmFile, lmLines, 50, 150)), "range after edit");
+});
+
+test("sed -n after a Read is served from line memory", () => {
+  clearSessions();
+  runHook("post_read.cjs", rangeReadEvent(lmFile, lmLines, 1, 300));
+  const r = runHook("post_bash.cjs", postBashEvent(`sed -n '20,120p' ${lmFile}`, shownLines(20, 120)));
+  expectSuppression(r, "sed after Read");
+  assert(noteOf(r).includes("lines 20-120"), `note should name the range: ${noteOf(r).slice(0, 120)}`);
+});
+
+test("Read after cat is served from line memory", () => {
+  clearSessions();
+  expectPassThrough(runHook("post_bash.cjs", postBashEvent(`cat "${lmFile}"`, shownLines(1, 300))), "first cat");
+  expectSuppression(runHook("post_read.cjs", rangeReadEvent(lmFile, lmLines, 10, 200)), "Read after cat");
+});
+
+test("head -n then a repeat head is served from line memory", () => {
+  clearSessions();
+  runHook("post_bash.cjs", postBashEvent(`head -n 80 lines.ts`, shownLines(1, 80)));
+  expectSuppression(runHook("post_bash.cjs", postBashEvent(`head -80 lines.ts`, shownLines(1, 80))), "repeat head");
+});
+
+test("shell output that doesn't match the file is not a file read", () => {
+  clearSessions();
+  runHook("post_bash.cjs", postBashEvent(`cat ${lmFile}`, "not the file\n" + bigBashOutput));
+  const session = readSession(SID);
+  assert(!session?.lines || Object.keys(session.lines).length === 0, "mismatched output must not be remembered");
+});
+
+test("piped or chained commands are not file reads", () => {
+  clearSessions();
+  runHook("post_bash.cjs", postBashEvent(`cat ${lmFile} | head -n 300`, shownLines(1, 300)));
+  runHook("post_bash.cjs", postBashEvent(`sed -n '1,300p' ${lmFile}; echo done`, shownLines(1, 300)));
+  const session = readSession(SID);
+  assert(!session?.lines || Object.keys(session.lines).length === 0, "compound commands must not be remembered");
+});
+
+test("free plan: line-memory hit is measured but NOT served", () => {
+  writeFreeConfig();
+  clearSessions();
+  runHook("post_read.cjs", rangeReadEvent(lmFile, lmLines, 1, 300));
+  expectPassThrough(runHook("post_read.cjs", rangeReadEvent(lmFile, lmLines, 50, 150)), "free sub-range");
+  assert(readSession(SID).hits === 1, "free coverage hit should still be counted");
+  writePaidConfig();
+});
+
+test("compact clears line memory", () => {
+  clearSessions();
+  runHook("post_read.cjs", rangeReadEvent(lmFile, lmLines, 1, 300));
+  runHook("session_start.cjs", { hook_event_name: "SessionStart", session_id: SID, source: "compact" });
+  expectPassThrough(runHook("post_read.cjs", rangeReadEvent(lmFile, lmLines, 50, 150)), "range after compact");
 });
 
 // ── post_bash tests ───────────────────────────────────────────────────────────
