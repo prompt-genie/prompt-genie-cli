@@ -998,6 +998,149 @@ test("events older than the server accepts are dropped locally", () => {
 
 process.env.PROMPT_GENIE_TELEMETRY = "0";
 
+// ── Other agents (Codex, Gemini CLI, Copilot CLI) ───────────────────────────────
+
+console.log("\n  other agents");
+
+function runAgentHook(agent, event, input) {
+  const result = spawnSync("node", [path.join(HOOKS_DIR, "agent_hook.cjs"), agent, event], {
+    input: typeof input === "string" ? input : JSON.stringify(input),
+    env: { ...process.env, HOME: tmpHome },
+    timeout: 6000,
+    encoding: "utf8",
+  });
+  return { exitCode: result.status ?? -1, stdout: result.stdout || "", stderr: result.stderr || "" };
+}
+const replyOf = (r) => parseJSON(r.stdout);
+const uploadedSources = () => fakeRequests()
+  .filter((q) => q.query.includes("recordTokenSavings"))
+  .flatMap((q) => JSON.parse(q.variables.entries).map((e) => e.source));
+
+const codexBash = (command, tool_response, session_id = "cx-1") => ({
+  session_id, cwd: tmpHome, hook_event_name: "PostToolUse", tool_name: "Bash", tool_use_id: "t1",
+  tool_input: { command }, tool_response,
+});
+const geminiTool = (tool_name, tool_input, llmContent, session_id = "gm-1") => ({
+  session_id, cwd: tmpHome, hook_event_name: "AfterTool", timestamp: new Date().toISOString(),
+  tool_name, tool_input, tool_response: { llmContent, returnDisplay: "" },
+});
+const copilotTool = (toolName, toolArgs, text, sessionId = "cp-1") => ({
+  sessionId, timestamp: Date.now(), cwd: tmpHome, toolName, toolArgs,
+  toolResult: { resultType: "success", textResultForLlm: text },
+});
+// Copilot's view numbers its lines; accept "N. text"
+const numbered = (from, to) => lmLines.slice(from - 1, to).map((l, i) => `${from + i}. ${l}`).join("\n");
+
+test("codex: a sed read of lines already shown is replaced via decision:block", () => {
+  writePaidConfig();
+  clearSessions();
+  const first = runAgentHook("codex", "post_tool", codexBash("sed -n '1,200p' lines.ts", shownLines(1, 200)));
+  assert(first.exitCode === 0 && first.stdout === "", `first read should pass through: ${first.stdout}`);
+  const again = replyOf(runAgentHook("codex", "post_tool", codexBash("sed -n '20,120p' lines.ts", shownLines(20, 120))));
+  assert(again?.decision === "block", `expected decision:block, got ${JSON.stringify(again)}`);
+  assert(again.reason.includes("lines 20-120"), `reason should name the range: ${again.reason.slice(0, 100)}`);
+});
+
+test("codex: argv commands and {output} responses are understood", () => {
+  clearSessions();
+  runAgentHook("codex", "post_tool", codexBash(["bash", "-lc", "cat lines.ts"], { output: shownLines(1, 300), exit_code: 0 }));
+  const again = replyOf(runAgentHook("codex", "post_tool", codexBash(["bash", "-lc", "head -n 150 lines.ts"], { output: shownLines(1, 150) })));
+  assert(again?.decision === "block", `expected a hit, got ${JSON.stringify(again)}`);
+});
+
+test("codex: compaction (SessionStart source=compact) clears memory", () => {
+  clearSessions();
+  runAgentHook("codex", "post_tool", codexBash("cat lines.ts", shownLines(1, 300)));
+  runAgentHook("codex", "session_start", { session_id: "cx-1", cwd: tmpHome, hook_event_name: "SessionStart", source: "compact" });
+  const r = runAgentHook("codex", "post_tool", codexBash("sed -n '20,120p' lines.ts", shownLines(20, 120)));
+  assert(r.stdout === "", "after compaction the read must pass through");
+});
+
+test("codex: Stop uploads the savings tagged CODEX", () => {
+  useFakeApi();
+  resetFake();
+  clearSessions();
+  runAgentHook("codex", "post_tool", codexBash("cat lines.ts", shownLines(1, 300)));
+  runAgentHook("codex", "post_tool", codexBash("sed -n '20,120p' lines.ts", shownLines(20, 120)));
+  const r = runAgentHook("codex", "stop", { session_id: "cx-1", cwd: tmpHome, hook_event_name: "Stop", turn_id: "x" });
+  assert(r.exitCode === 0 && r.stdout === "", `stop must stay silent on stdout: ${r.stdout}`);
+  assert(uploadedSources().join() === "CODEX", `sources uploaded: ${uploadedSources()}`);
+  assert((readSession("cx-1").pendingUploads || []).length === 0, "upload should be cleared after success");
+});
+
+test("gemini: read_file with a truncation header is matched and replaced via decision:deny", () => {
+  clearSessions();
+  runAgentHook("gemini", "post_tool", geminiTool("read_file", { file_path: "lines.ts" }, shownLines(1, 300)));
+  const header = "IMPORTANT: The file content has been truncated.\nStatus: Showing lines 50-149 of 300 total lines.\nAction: To read more, use offset and limit.\n\n--- FILE CONTENT (truncated) ---\n";
+  const again = replyOf(runAgentHook("gemini", "post_tool",
+    geminiTool("read_file", { file_path: lmFile, offset: 49, limit: 100 }, header + shownLines(50, 149))));
+  assert(again?.decision === "deny", `expected decision:deny, got ${JSON.stringify(again)}`);
+  assert(again.reason.includes("lines 50-149"), `reason should name the range: ${again.reason.slice(0, 100)}`);
+});
+
+test("gemini: run_shell_command output is unwrapped before matching", () => {
+  clearSessions();
+  runAgentHook("gemini", "post_tool", geminiTool("read_file", { file_path: lmFile }, shownLines(1, 300)));
+  const wrapped = `Command: sed -n '10,90p' lines.ts\nDirectory: (root)\nOutput: ${shownLines(10, 90)}Error: (none)\nExit Code: 0\nSignal: (none)\nBackground PIDs: (none)\nProcess Group PGID: 4242`;
+  const again = replyOf(runAgentHook("gemini", "post_tool", geminiTool("run_shell_command", { command: "sed -n '10,90p' lines.ts" }, wrapped)));
+  assert(again?.decision === "deny", `expected a hit, got ${JSON.stringify(again)}`);
+});
+
+test("gemini: PreCompress clears memory and AfterAgent uploads tagged GEMINI_CLI", () => {
+  resetFake();
+  clearSessions();
+  runAgentHook("gemini", "post_tool", geminiTool("read_file", { file_path: lmFile }, shownLines(1, 300)));
+  runAgentHook("gemini", "compact", { session_id: "gm-1", cwd: tmpHome, hook_event_name: "PreCompress" });
+  const r = runAgentHook("gemini", "post_tool", geminiTool("read_file", { file_path: lmFile, offset: 9, limit: 50 }, shownLines(10, 59)));
+  assert(r.stdout === "", "after compression the read must pass through");
+  runAgentHook("gemini", "stop", { session_id: "gm-1", cwd: tmpHome, hook_event_name: "AfterAgent", prompt: "p", prompt_response: "r" });
+  assert(uploadedSources().join() === "GEMINI_CLI", `sources uploaded: ${uploadedSources()}`);
+});
+
+test("copilot: a view of lines already shown is replaced via modifiedResult", () => {
+  clearSessions();
+  runAgentHook("copilot", "post_tool", copilotTool("view", { path: "lines.ts" }, numbered(1, 300)));
+  const again = replyOf(runAgentHook("copilot", "post_tool", copilotTool("view", { path: lmFile, view_range: [50, 150] }, numbered(50, 150))));
+  assert(again?.modifiedResult?.resultType === "success", `expected modifiedResult, got ${JSON.stringify(again)}`);
+  assert(again.modifiedResult.textResultForLlm.includes("lines 50-150"), "note should name the range");
+});
+
+test("copilot: numbers that don't count up from the range are not trusted", () => {
+  clearSessions();
+  runAgentHook("copilot", "post_tool", copilotTool("view", { path: lmFile }, numbered(1, 300)));
+  // Claims to start at 50 but shows lines 60.. : must not be matched as lines 50..
+  const wrong = lmLines.slice(59, 150).map((l, i) => `${50 + i}. ${l}`).join("\n");
+  const r = runAgentHook("copilot", "post_tool", copilotTool("view", { path: lmFile, view_range: [50, 140] }, wrong));
+  assert(r.stdout === "", `mismatched numbering must pass through: ${r.stdout.slice(0, 100)}`);
+});
+
+test("copilot: repeated bash output and string toolArgs are handled; agentStop uploads COPILOT", () => {
+  resetFake();
+  clearSessions();
+  runAgentHook("copilot", "post_tool", copilotTool("bash", JSON.stringify({ command: "ls -la" }), bigBashOutput));
+  const again = replyOf(runAgentHook("copilot", "post_tool", copilotTool("bash", { command: "ls -la" }, bigBashOutput)));
+  assert(again?.modifiedResult, `expected a repeat hit, got ${JSON.stringify(again)}`);
+  runAgentHook("copilot", "stop", { sessionId: "cp-1", timestamp: Date.now(), cwd: tmpHome, stopReason: "end_turn" });
+  assert(uploadedSources().join() === "COPILOT", `sources uploaded: ${uploadedSources()}`);
+});
+
+test("free plan: other agents are measured but never replaced", () => {
+  writeFreeConfig();
+  clearSessions();
+  runAgentHook("copilot", "post_tool", copilotTool("view", { path: lmFile }, numbered(1, 300)));
+  const r = runAgentHook("copilot", "post_tool", copilotTool("view", { path: lmFile, view_range: [50, 150] }, numbered(50, 150)));
+  assert(r.stdout === "", "free plan must not replace output");
+  assert(readSession("cp-1").hits === 1, "free hit should still be counted");
+  writePaidConfig();
+});
+
+test("unknown agent, unknown event or malformed input: exit 0, no output", () => {
+  for (const [agent, event, input] of [["nope", "post_tool", {}], ["codex", "bogus", { session_id: "x" }], ["gemini", "post_tool", "{{bad"], ["copilot", "post_tool", {}]]) {
+    const r = runAgentHook(agent, event, input);
+    assert(r.exitCode === 0 && r.stdout === "", `${agent}/${event}: exit ${r.exitCode}, stdout ${r.stdout}`);
+  }
+});
+
 fakeServer.kill();
 delete process.env.PG_GRAPHQL_URL;
 fs.rmSync(fakeDir, { recursive: true, force: true });
@@ -1060,6 +1203,57 @@ test("install keeps a telemetry opt-out in pg_config.json and queues nothing", (
   });
   assert(JSON.parse(fs.readFileSync(path.join(home, ".claude", "pg_config.json"), "utf8")).telemetry === false, "opt-out kept");
   assert(!fs.existsSync(path.join(home, ".claude", "pg_events.json")), "nothing queued");
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("other agents: only the chosen ones are wired, user hooks kept, idempotent", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pg-install-"));
+  for (const d of [".claude", ".codex", ".gemini", ".copilot"]) fs.mkdirSync(path.join(home, d), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "pg_config.json"), JSON.stringify({ agents: ["codex", "gemini", "copilot"] }));
+  fs.writeFileSync(path.join(home, ".codex", "hooks.json"), JSON.stringify({
+    hooks: { PostToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "audit-log" }] }] },
+  }));
+  fs.writeFileSync(path.join(home, ".gemini", "settings.json"), JSON.stringify({
+    theme: "dark", hooks: { BeforeTool: [{ matcher: "write_file", hooks: [{ type: "command", command: "guard.sh" }] }] },
+  }));
+  const run = () => spawnSync(process.execPath, ["-e", `require(${JSON.stringify(path.join(__dirname, "..", "bin", "install.cjs"))}).wireHooks()`], {
+    env: { ...process.env, HOME: home, USERPROFILE: home },
+    encoding: "utf8",
+  });
+  assert(run().status === 0, "wireHooks failed");
+  run();
+  const read = (...p) => JSON.parse(fs.readFileSync(path.join(home, ...p), "utf8"));
+  const commands = (hooks, event) => (hooks[event] || []).flatMap((g) => (g.hooks || []).map((h) => h.command));
+
+  const codex = read(".codex", "hooks.json").hooks;
+  assert(commands(codex, "PostToolUse").includes("audit-log"), "codex: user's hook kept");
+  assert(commands(codex, "PostToolUse").filter((c) => c.endsWith("agent_hook.cjs\" codex post_tool")).length === 1, "codex: ours once");
+  assert(commands(codex, "Stop").length === 1 && commands(codex, "SessionStart").length === 1, "codex: stop + session start");
+
+  const gemini = read(".gemini", "settings.json");
+  assert(gemini.theme === "dark" && commands(gemini.hooks, "BeforeTool").includes("guard.sh"), "gemini: user settings kept");
+  assert(commands(gemini.hooks, "AfterTool").filter((c) => c.includes("gemini post_tool")).length === 1, "gemini: ours once");
+  assert(gemini.hooks.AfterTool.find((g) => g.matcher === "read_file|run_shell_command"), "gemini: tool matcher");
+  assert(commands(gemini.hooks, "AfterAgent").length === 1 && commands(gemini.hooks, "PreCompress").length === 1, "gemini: lifecycle hooks");
+
+  const copilot = read(".copilot", "hooks", "prompt-genie.json");
+  assert(copilot.version === 1 && copilot.hooks.postToolUse[0].command.includes("copilot post_tool"), "copilot: own hooks file");
+  assert(copilot.hooks.agentStop && copilot.hooks.preCompact && copilot.hooks.sessionStart, "copilot: lifecycle hooks");
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("other agents: nothing is wired for agents the user didn't choose", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pg-install-"));
+  for (const d of [".claude", ".codex", ".gemini"]) fs.mkdirSync(path.join(home, d), { recursive: true });
+  // Non-interactive install (like the self-updater): detected agents are not added
+  const r = spawnSync(process.execPath, ["-e", `require(${JSON.stringify(path.join(__dirname, "..", "bin", "install.cjs"))}).finishInstall("a@b.co", "PRO", "tok")`], {
+    env: { ...process.env, HOME: home, USERPROFILE: home, PROMPT_GENIE_TELEMETRY: "0" },
+    encoding: "utf8",
+  });
+  assert(r.status === 0, `install exited ${r.status}: ${r.stderr}`);
+  assert(!fs.existsSync(path.join(home, ".codex", "hooks.json")), "codex must not be wired without consent");
+  assert(!fs.existsSync(path.join(home, ".gemini", "settings.json")), "gemini must not be wired without consent");
+  assert(fs.existsSync(path.join(home, ".claude", "settings.json")), "claude code still wired");
   fs.rmSync(home, { recursive: true, force: true });
 });
 

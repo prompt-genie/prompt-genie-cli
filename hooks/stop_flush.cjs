@@ -70,7 +70,7 @@ async function refreshToken(oldToken) {
 // Move the live counters into a pending upload with its own id. If the upload
 // fails or its response is lost, the same entry (same id) is retried next time
 // and the server records it once; new savings keep counting separately.
-function stagePendingUpload(session, codebase) {
+function stagePendingUpload(session, codebase, source) {
   const hits = session.hits || 0;
   const misses = session.misses || 0;
   const tokensSaved = session.tokensSaved || 0;
@@ -78,7 +78,7 @@ function stagePendingUpload(session, codebase) {
   if (hits > 0 || misses > 0) pending.push({
     id: `cc-${crypto.randomUUID()}`,
     date: session.date || lib.today(),
-    source: "CLAUDE_CODE",
+    source,
     feature: "CONTEXT_MEMORY",
     hits,
     misses,
@@ -119,8 +119,9 @@ async function flushEvents(token, { force = false } = {}) {
   } catch { /* offline: events are retried at the next Stop */ }
 }
 
-async function main() {
-  const event = (await lib.readStdinJson(500)) || {};
+// Uploads one session's savings and sends queued events. `source` is the
+// agent the savings came from (CLAUDE_CODE, CODEX, GEMINI_CLI, COPILOT).
+async function flush(event, { source = "CLAUDE_CODE" } = {}) {
   const sessionId = event.session_id;
 
   // Housekeeping: drop stale per-session files and pre-0.4 global caches
@@ -137,10 +138,10 @@ async function main() {
   const tokensSaved = session.tokensSaved || 0;
   const hasPending = (session.pendingUploads || []).length > 0;
   const hasEvents = lib.queuedEvents().length > 0;
-  if (hits === 0 && misses === 0 && !hasPending && !hasEvents) process.exit(0);
+  if (hits === 0 && misses === 0 && !hasPending && !hasEvents) return;
 
   const token = config.token;
-  if (!token) process.exit(0);
+  if (!token) return;
 
   // Verify or refresh JWT
   let jwt = lib.verifyJWT(token);
@@ -149,7 +150,7 @@ async function main() {
 
   if (!jwt) {
     const refreshed = await refreshToken(token);
-    if (!refreshed) process.exit(0);
+    if (!refreshed) return;
     plan = refreshed.plan;
     liveToken = refreshed.token;
   }
@@ -170,13 +171,13 @@ async function main() {
     session.pendingUploads = [];
     lib.saveSession(sessionId, session);
     await flushEvents(liveToken);
-    process.exit(0);
+    return;
   }
 
   // PRO/TEAMS: upload. The server takes the account from the signed token, so
   // the request carries no email.
   if (hits > 0 || misses > 0) lib.queueEvent("cli_savings_recorded", { hits, misses, tokens_saved: tokensSaved });
-  stagePendingUpload(session, path.basename(event.cwd || process.cwd()));
+  stagePendingUpload(session, path.basename(event.cwd || process.cwd()), source);
   lib.saveSession(sessionId, session);
 
   if (session.pendingUploads.length) {
@@ -196,7 +197,13 @@ async function main() {
   }
 
   await flushEvents(liveToken, { force: session.pendingUploads.length > 0 });
+}
+
+async function main() {
+  await flush((await lib.readStdinJson(500)) || {});
   process.exit(0);
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { flush };

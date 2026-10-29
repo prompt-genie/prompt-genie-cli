@@ -117,20 +117,122 @@ function isOurs(hook) {
   return typeof hook?.command === "string" && hook.command.replace(/\\/g, "/").includes("/.prompt-genie/hooks/");
 }
 
-// Add our hooks next to whatever the user already has. Earlier installs replaced
-// whole event lists, which deleted the user's own hooks; now we only remove our
-// previous entries (so reinstalling never duplicates them) and keep the rest.
-function wireHooks() {
-  const settings = loadJson(SETTINGS_FILE);
-  settings.hooks = settings.hooks || {};
-  for (const [event, groups] of Object.entries(ourHooks())) {
-    const existing = Array.isArray(settings.hooks[event]) ? settings.hooks[event] : [];
+// Add our hook groups to a { Event: [group, ...] } map next to whatever the user
+// already has. Earlier installs replaced whole event lists, which deleted the
+// user's own hooks; now we only remove our previous entries (so reinstalling
+// never duplicates them) and keep the rest.
+function mergeHookGroups(hooks, ours) {
+  for (const [event, groups] of Object.entries(ours)) {
+    const existing = Array.isArray(hooks[event]) ? hooks[event] : [];
     const kept = existing
       .map((group) => ({ ...group, hooks: (group.hooks || []).filter((h) => !isOurs(h)) }))
       .filter((group) => group.hooks.length > 0);
-    settings.hooks[event] = [...kept, ...groups];
+    hooks[event] = [...kept, ...groups];
   }
+  return hooks;
+}
+
+// ── Other coding agents ───────────────────────────────────────────────────────
+
+// Each runs hooks/agent_hook.cjs with its own name and event. Codex and Gemini
+// keep hooks in a settings file we merge into; Copilot reads every file in its
+// hooks folder, so it gets a file of its own.
+const AGENTS = {
+  codex: {
+    name: "Codex CLI",
+    dir: ".codex",
+    bin: "codex",
+    wire() {
+      const file = path.join(os.homedir(), ".codex", "hooks.json");
+      const cmd = (event) => [{ type: "command", command: agentCommand("codex", event), timeout: 30 }];
+      const config = loadJson(file);
+      config.hooks = mergeHookGroups(config.hooks || {}, {
+        PostToolUse: [{ matcher: "Bash", hooks: cmd("post_tool") }],
+        SessionStart: [{ hooks: cmd("session_start") }],
+        Stop: [{ hooks: cmd("stop") }],
+      });
+      saveJson(file, config);
+    },
+  },
+  gemini: {
+    name: "Gemini CLI",
+    dir: ".gemini",
+    bin: "gemini",
+    wire() {
+      const file = path.join(os.homedir(), ".gemini", "settings.json");
+      const cmd = (event) => [{ name: "prompt-genie", type: "command", command: agentCommand("gemini", event), timeout: 30000 }];
+      const settings = loadJson(file);
+      settings.hooks = mergeHookGroups(settings.hooks || {}, {
+        AfterTool: [{ matcher: "read_file|run_shell_command", hooks: cmd("post_tool") }],
+        SessionStart: [{ hooks: cmd("session_start") }],
+        PreCompress: [{ hooks: cmd("compact") }],
+        AfterAgent: [{ hooks: cmd("stop") }],
+      });
+      saveJson(file, settings);
+    },
+  },
+  copilot: {
+    name: "GitHub Copilot CLI",
+    dir: ".copilot",
+    bin: "copilot",
+    wire() {
+      const cmd = (event) => [{ type: "command", command: agentCommand("copilot", event), timeoutSec: 30 }];
+      saveJson(path.join(os.homedir(), ".copilot", "hooks", "prompt-genie.json"), {
+        version: 1,
+        hooks: {
+          postToolUse: cmd("post_tool"),
+          sessionStart: cmd("session_start"),
+          preCompact: cmd("compact"),
+          agentStop: cmd("stop"),
+        },
+      });
+    },
+  },
+};
+
+function agentCommand(agent, event) {
+  return `${hookCommand("agent_hook.cjs")} ${agent} ${event}`;
+}
+
+function onPath(bin) {
+  const exts = process.platform === "win32" ? ["", ".cmd", ".exe"] : [""];
+  return (process.env.PATH || "").split(path.delimiter).some((dir) =>
+    exts.some((ext) => dir && fs.existsSync(path.join(dir, bin + ext))));
+}
+
+// Agents installed on this machine that we could set up
+function detectAgents() {
+  return Object.keys(AGENTS).filter((id) =>
+    fs.existsSync(path.join(os.homedir(), AGENTS[id].dir)) || onPath(AGENTS[id].bin));
+}
+
+// The agents the user chose at install time (kept in pg_config.json)
+function chosenAgents() {
+  const agents = loadJson(CONFIG_FILE).agents;
+  return Array.isArray(agents) ? agents.filter((id) => AGENTS[id]) : [];
+}
+
+// Wire Claude Code, plus every other agent the user opted into. The
+// self-updater calls this too, so it never adds an agent on its own.
+function wireHooks() {
+  const settings = loadJson(SETTINGS_FILE);
+  settings.hooks = mergeHookGroups(settings.hooks || {}, ourHooks());
   saveJson(SETTINGS_FILE, settings);
+  for (const id of chosenAgents()) {
+    try { AGENTS[id].wire(); } catch (err) { console.error(`  Could not set up ${AGENTS[id].name}: ${err.message}`); }
+  }
+}
+
+// Ask about agents found on this machine that aren't set up yet (only when
+// someone is at the keyboard). Returns the full list of chosen agents.
+async function chooseAgents() {
+  const chosen = chosenAgents();
+  if (!process.stdin.isTTY) return chosen;
+  for (const id of detectAgents().filter((a) => !chosen.includes(a))) {
+    const ans = await ask(`  Found ${AGENTS[id].name}. Use Prompt Genie there too? [Y/n] `);
+    if (!/^n/i.test(ans)) chosen.push(id);
+  }
+  return chosen;
 }
 
 // Queue install events for the hooks to send at the end of the first turn
@@ -155,14 +257,25 @@ function queueInstallEvents(events) {
   } catch { /* never fail an install over analytics */ }
 }
 
-function finishInstall(email, plan, token, { signedIn = false } = {}) {
+async function finishInstall(email, plan, token, { signedIn = false } = {}) {
   const reinstall = fs.existsSync(path.join(HOOKS_DEST, "stop_flush.cjs"));
+  const agents = await chooseAgents();
+  const telemetry = loadJson(CONFIG_FILE).telemetry;
+  saveJson(CONFIG_FILE, {
+    email, plan, token,
+    ...(agents.length ? { agents } : {}),
+    ...(telemetry === false ? { telemetry } : {}),
+  });
   copyHooks();
   wireHooks();
-  const telemetry = loadJson(CONFIG_FILE).telemetry;
-  saveJson(CONFIG_FILE, telemetry === false ? { email, plan, token, telemetry } : { email, plan, token });
   queueInstallEvents([
     ...(signedIn ? [["cli_signed_in", {}]] : []),
+    ...agents.map((id) => ["cli_installed", {
+      agent: id,
+      os: process.platform,
+      node_major: Number(process.versions.node.split(".")[0]),
+      reinstall: reinstall ? "yes" : "no",
+    }]),
     ["cli_installed", {
       agent: "claude_code",
       os: process.platform,
@@ -171,16 +284,17 @@ function finishInstall(email, plan, token, { signedIn = false } = {}) {
     }],
   ]);
 
+  const where = ["Claude Code", ...agents.map((id) => AGENTS[id].name)].join(", ");
   const isPaid = ["PRO", "ANNUAL_PRO", "THREE_DAY_PASS", "TEAMS", "ENTERPRISE", "LIFETIME"].includes(plan);
   if (isPaid) {
     console.log(`
   You're all set.
 
-  Prompt Genie is now active in Claude Code. Every file Claude reads
-  gets remembered for the session. No more paying to re-read
+  Prompt Genie is now active in ${where}. Every file your agent
+  reads gets remembered for the session. No more paying to re-read
   the same code on every turn.
 
-  Restart VS Code to activate, then start a session as normal.
+  Restart them to activate, then start a session as normal.
   Your context savings will appear at prompt-genie.com/dashboard.
 
   Prompt Genie sends usage events linked to your account (session starts
@@ -203,7 +317,7 @@ function finishInstall(email, plan, token, { signedIn = false } = {}) {
 }
 
 async function main() {
-  console.log("\n  Prompt Genie for Claude Code\n");
+  console.log("\n  Prompt Genie for Claude Code, Codex, Gemini CLI and Copilot CLI\n");
 
   // Check for existing valid token — skip auth if still good
   const existing = loadJson(CONFIG_FILE);
@@ -211,7 +325,7 @@ async function main() {
     const jwt = verifyJWT(existing.token);
     if (jwt) {
       console.log(`  Updating hooks for ${existing.email}...`);
-      finishInstall(existing.email, existing.plan, existing.token);
+      await finishInstall(existing.email, existing.plan, existing.token);
       return;
     }
 
@@ -223,14 +337,14 @@ async function main() {
       );
       const result = JSON.parse(res.data?.cliAuth || "{}");
       if (result.success && result.token) {
-        finishInstall(existing.email, result.plan, result.token);
+        await finishInstall(existing.email, result.plan, result.token);
         return;
       }
     } catch { /* fall through to full auth */ }
   }
 
   // Full auth flow (first install or refresh failed)
-  console.log("  Reduce what Claude re-reads every session.\n");
+  console.log("  Reduce what your coding agent re-reads every session.\n");
 
   const email = await ask("  Enter your Prompt Genie email: ");
   if (!email || !email.includes("@")) {
@@ -270,7 +384,7 @@ async function main() {
       console.error("  " + (result.error || "Verification failed. Try again."));
       process.exit(1);
     }
-    finishInstall(email, result.plan, result.token, { signedIn: true });
+    await finishInstall(email, result.plan, result.token, { signedIn: true });
   } catch (err) {
     console.error("  Network error:", err.message);
     process.exit(1);
@@ -284,4 +398,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { wireHooks, isOurs, finishInstall };
+module.exports = { wireHooks, isOurs, finishInstall, AGENTS, detectAgents };

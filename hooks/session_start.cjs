@@ -28,26 +28,32 @@ function maybeSelfUpdate() {
   } catch { /* updating is best-effort */ }
 }
 
-async function main() {
-  const data = await lib.readStdinJson();
-  if (!data || data.hook_event_name !== "SessionStart") process.exit(0);
-
-  if (data.source === "startup" || data.source === "resume") {
-    lib.queueEvent("cli_session_started", { source: data.source });
-    maybeSelfUpdate();
-  }
-
-  if (data.source !== "compact" && data.source !== "clear") process.exit(0);
-
-  const session = lib.loadSession(data.session_id);
-  if (!session.files && !session.bash && !session.lines && !session.hintedCount) process.exit(0);
-
+// Wipe what the session remembers being in context (after compaction or /clear)
+function forgetContext(sessionId) {
+  const session = lib.loadSession(sessionId);
+  if (!session.files && !session.bash && !session.lines && !session.hintedCount) return;
   session.files = {};
   session.bash = {};
   session.lines = {};
   session.hintedCount = 0;
-  lib.saveSession(data.session_id, session);
+  lib.saveSession(sessionId, session);
+}
+
+// source: startup | resume start a session; compact | clear empty its context
+function onSessionStart(sessionId, source) {
+  if (source === "startup" || source === "resume") {
+    lib.queueEvent("cli_session_started", { source });
+    maybeSelfUpdate();
+  }
+  if (source === "compact" || source === "clear") forgetContext(sessionId);
+}
+
+async function main() {
+  const data = await lib.readStdinJson();
+  if (data && data.hook_event_name === "SessionStart") onSessionStart(data.session_id, data.source);
   process.exit(0);
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { onSessionStart, forgetContext };

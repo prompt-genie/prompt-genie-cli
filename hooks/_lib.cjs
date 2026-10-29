@@ -11,7 +11,7 @@ const STATS_FILE   = path.join(CLAUDE_DIR, "pg_stats.json");
 const CONFIG_FILE  = path.join(CLAUDE_DIR, "pg_config.json");
 const EVENTS_FILE  = path.join(CLAUDE_DIR, "pg_events.json");
 
-const CLI_VERSION = "0.6.2";
+const CLI_VERSION = "0.7.0";
 
 const PUBLIC_KEY = process.env.PG_PUBLIC_KEY || `-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArjBMJfK6K8JnPvZR3kuS
@@ -132,6 +132,54 @@ function rememberLines(session, filePath, mtime, start, lines) {
   for (let i = 0; i < lines.length; i++) entry.h[start - 1 + i] = lineHash(lines[i]);
   entry.ts = Date.now();
   evictOldest(all, MAX_LINE_FILES);
+}
+
+const MAX_FILE_READ_BYTES = 2 * 1024 * 1024;
+const MAX_HEADER_LINES = 12; // e.g. Gemini's "showing lines X-Y" notice, Codex's exit-code preamble
+const MAX_FOOTER_LINES = 8;
+const LINE_NUMBER_RE = /^\s*(\d+)(?:[.:|→]\s?|\t)(.*)$/;
+
+function diskLines(filePath) {
+  try {
+    if (fs.statSync(filePath).size > MAX_FILE_READ_BYTES) return null;
+    const text = fs.readFileSync(filePath, "utf8");
+    const lines = text.split("\n");
+    if (text.endsWith("\n")) lines.pop();
+    return lines;
+  } catch { return null; }
+}
+
+// If `text` shows lines from.. of the file as it is on disk now, return
+// { start, lines } for the run it shows; otherwise null. Tolerates a few
+// header/footer lines around the content and, with numbers, "12. " / "12\t"
+// style prefixes as long as they count up from `from`. This check is what makes
+// a line-number note trustworthy, so anything that doesn't line up is rejected.
+function fileLinesShown(filePath, from, text, { numbers = true } = {}) {
+  const file = diskLines(filePath);
+  if (!file || !(from >= 1) || from > file.length || typeof text !== "string") return null;
+  const out = text.split("\n");
+  if (out.length && out[out.length - 1] === "") out.pop();
+
+  const variants = [out.map((t) => ({ t }))];
+  if (numbers) variants.push(out.map((t) => {
+    const m = t.match(LINE_NUMBER_RE);
+    return m ? { n: Number(m[1]), t: m[2] } : { t };
+  }));
+
+  for (const lines of variants) {
+    for (let k = 0; k < Math.min(MAX_HEADER_LINES + 1, lines.length); k++) {
+      let n = 0;
+      while (k + n < lines.length && from - 1 + n < file.length) {
+        const line = lines[k + n];
+        if (line.t !== file[from - 1 + n] || (line.n !== undefined && line.n !== from + n)) break;
+        n++;
+      }
+      if (n > 0 && lines.length - (k + n) <= MAX_FOOTER_LINES) {
+        return { start: from, lines: file.slice(from - 1, from - 1 + n) };
+      }
+    }
+  }
+  return null;
 }
 
 // [[from, to], ...] runs of line numbers where covered[i] === want
@@ -347,7 +395,7 @@ module.exports = {
   CLAUDE_DIR, SESSIONS_DIR, STATS_FILE, CONFIG_FILE, EVENTS_FILE, PUBLIC_KEY, CLI_VERSION,
   loadJson, saveJsonAtomic, unlinkQuiet,
   sha1, estimateTokens, today, buildLineDelta,
-  fileMtime, seenLines, rememberLines, buildCoverageNote,
+  fileMtime, seenLines, rememberLines, buildCoverageNote, fileLinesShown,
   sessionFile, loadSession, saveSession, deleteSession, gcSessions, evictOldest,
   bumpStats,
   verifyJWT, decodeJWT, isPaidPlan, currentPlanIsPaid,
