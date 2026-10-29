@@ -1,7 +1,7 @@
 {
   "name": "prompt-genie",
-  "version": "0.6.2",
-  "description": "Cut your Claude Code costs. Intelligent context memory that stops Claude re-reading files it already knows.",
+  "version": "0.7.0",
+  "description": "Cut your coding agent costs. Context memory for Claude Code, Codex, Gemini CLI and Copilot CLI that stops re-reading files the model already has.",
   "bin": {
     "prompt-genie": "bin/install.cjs"
   },
@@ -17,6 +17,9 @@
   "keywords": [
     "claude",
     "claude-code",
+    "codex",
+    "gemini-cli",
+    "copilot",
     "context",
     "ai",
     "cost-savings",

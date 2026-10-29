@@ -1,8 +1,8 @@
-# Prompt Genie for Claude Code
+# Prompt Genie for Claude Code, Codex, Gemini CLI and Copilot CLI
 
-**Stop paying to re-read the same code.** Prompt Genie remembers what Claude Code
-has already read this session, so identical re-reads cost ~15 tokens instead of
-the whole file.
+**Stop paying to re-read the same code.** Prompt Genie remembers what your coding
+agent has already read this session, so identical re-reads cost ~15 tokens instead
+of the whole file.
 
 ```bash
 npx prompt-genie
@@ -64,8 +64,25 @@ The installer:
 2. Wires them into `~/.claude/settings.json` (`PreToolUse`, `PostToolUse`,
    `UserPromptSubmit`, `SessionStart`, `Stop`)
 3. Verifies your plan
+4. Offers to set up the other coding agents it finds on your machine (see below)
 
 Restart Claude Code (or your IDE) after installing so the new hooks load.
+
+### Other coding agents
+
+If Codex CLI, Gemini CLI or GitHub Copilot CLI is installed, the installer asks
+whether to use Prompt Genie there too. The same context memory and the same
+account work in each; savings show on your dashboard by agent.
+
+| Agent | Hooks written to | What's covered |
+|---|---|---|
+| Codex CLI | `~/.codex/hooks.json` | shell reads (`cat`, `sed -n`, `head`) and repeated commands |
+| Gemini CLI | `~/.gemini/settings.json` | `read_file`, shell reads and repeated commands |
+| Copilot CLI | `~/.copilot/hooks/prompt-genie.json` | `view`, shell reads and repeated commands |
+
+Your own hooks in those files are kept. Rerun `npx prompt-genie` to add an agent
+you install later. Cursor isn't supported: its hooks can't replace what the
+model reads.
 
 ## Seeing your savings
 
@@ -88,8 +105,10 @@ measure-only mode and shows you, at the end of each session, how many tokens you
 
 ## Uninstalling
 
-Remove the Prompt Genie entries from `~/.claude/settings.json` and delete
-`~/.prompt-genie/`.
+Remove the Prompt Genie entries (commands under `~/.prompt-genie/hooks/`) from
+`~/.claude/settings.json`, and from `~/.codex/hooks.json` and
+`~/.gemini/settings.json` if you set those up. Delete
+`~/.copilot/hooks/prompt-genie.json` and `~/.prompt-genie/`.
 
 ## How your data is handled
 

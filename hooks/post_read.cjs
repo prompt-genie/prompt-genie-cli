@@ -59,15 +59,16 @@ function trimStoredText(files) {
   }
 }
 
-async function main() {
-  const data = await lib.readStdinJson();
-  if (!data || data.tool_name !== "Read") process.exit(0);
+// Records a Read in session memory and returns the note that should replace its
+// output, or null to let the output through. Free plans are measured only.
+function handleRead(data) {
+  if (!data || data.tool_name !== "Read") return null;
 
   const filePath = data.tool_input?.file_path;
-  if (!filePath) process.exit(0);
+  if (!filePath) return null;
 
   const content = extractText(data.tool_response);
-  if (!content) process.exit(0);
+  if (!content) return null;
 
   // Key by file + range so partial reads of big files dedupe independently
   // and a chunked read never clobbers the full-read entry
@@ -98,15 +99,7 @@ async function main() {
     lib.bumpStats({ hits: 1, tokensSaved });
 
     // Paid plans get the actual benefit; free plans are measured only.
-    if (lib.currentPlanIsPaid()) {
-      process.stdout.write(JSON.stringify({
-        hookSpecificOutput: {
-          hookEventName: "PostToolUse",
-          updatedToolOutput: `[Already in context, file unchanged since your last read. ${lineCount} lines. Refer to your earlier read for the content.]`,
-        },
-      }));
-    }
-    process.exit(0);
+    return paidOnly(`[Already in context, file unchanged since your last read. ${lineCount} lines. Refer to your earlier read for the content.]`);
   }
 
   // 2) Covered by earlier reads of other ranges (or shell reads) of the
@@ -125,15 +118,7 @@ async function main() {
     lib.saveSession(data.session_id, session);
     lib.bumpStats({ hits: 1, tokensSaved: cover.savedTokens });
 
-    if (lib.currentPlanIsPaid()) {
-      process.stdout.write(JSON.stringify({
-        hookSpecificOutput: {
-          hookEventName: "PostToolUse",
-          updatedToolOutput: cover.note,
-        },
-      }));
-    }
-    process.exit(0);
+    return paidOnly(cover.note);
   }
 
   // 3) Near repeat — same target, small change vs the earlier read (edit -> re-read).
@@ -152,15 +137,7 @@ async function main() {
       lib.saveSession(data.session_id, session);
       lib.bumpStats({ hits: 1, tokensSaved: delta.savedTokens });
 
-      if (lib.currentPlanIsPaid()) {
-        process.stdout.write(JSON.stringify({
-          hookSpecificOutput: {
-            hookEventName: "PostToolUse",
-            updatedToolOutput: delta.note,
-          },
-        }));
-      }
-      process.exit(0);
+      return paidOnly(delta.note);
     }
   }
 
@@ -174,8 +151,43 @@ async function main() {
   remember();
   lib.saveSession(data.session_id, session);
   lib.bumpStats({ misses: 1 });
+  return null;
+}
 
+function paidOnly(note) {
+  return lib.currentPlanIsPaid() ? note : null;
+}
+
+// A file read from another agent (Copilot's view, Gemini's read_file), given
+// as the path, the first line it asked for and the model-visible text. When the
+// text is verifiably lines of the file on disk (once headers and line-number
+// prefixes are set aside) it gets full line memory; otherwise it's matched
+// only against byte-identical repeats of the same read.
+function handleAgentRead({ sessionId, cwd, filePath, from = 1, text }) {
+  if (!filePath || typeof text !== "string" || !text) return null;
+  const shown = lib.fileLinesShown(filePath, from, text);
+  const tool_response = shown
+    ? { file: { content: shown.lines.join("\n"), startLine: shown.start, numLines: shown.lines.length } }
+    : text;
+  return handleRead({
+    tool_name: "Read",
+    session_id: sessionId,
+    cwd,
+    tool_input: { file_path: filePath, ...(from > 1 ? { offset: from } : {}) },
+    tool_response,
+  });
+}
+
+async function main() {
+  const note = handleRead(await lib.readStdinJson());
+  if (note) {
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: { hookEventName: "PostToolUse", updatedToolOutput: note },
+    }));
+  }
   process.exit(0);
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { handleRead, handleAgentRead };

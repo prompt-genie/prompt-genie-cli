@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 process.on("uncaughtException", (err) => { process.stderr.write("pg post_bash: " + err.message + "\n"); process.exit(0); });
-const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const lib = require("./_lib.cjs");
@@ -72,7 +71,6 @@ function isReadOnly(command) {
 // `cat FILE`, `sed -n 'A,Bp' FILE` and `head -n N FILE` are file reads by
 // another name. Only the plain single-file forms count; anything piped,
 // chained or globbed is left to the command-level dedup below.
-const MAX_FILE_READ_BYTES = 2 * 1024 * 1024;
 const FILE_ARG = String.raw`('[^']+'|"[^"$\`\\]+"|[^\s'"$\`;|&<>*?(){}\\]+)`;
 const CAT_RE  = new RegExp(String.raw`^cat\s+${FILE_ARG}$`);
 const SED_RE  = new RegExp(String.raw`^sed\s+-n\s+(['"]?)(\d+)(?:,(\d+))?p\1\s+${FILE_ARG}$`);
@@ -104,20 +102,12 @@ function parseFileRead(command, cwd) {
   return null;
 }
 
-// The file lines the command printed, or null unless the output is exactly
-// those lines of the file as it is on disk now (so line numbers are trustworthy)
-function linesShown(fileRead, stdout) {
-  let text;
-  try {
-    if (fs.statSync(fileRead.filePath).size > MAX_FILE_READ_BYTES) return null;
-    text = fs.readFileSync(fileRead.filePath, "utf8");
-  } catch { return null; }
-  const all = text.split("\n");
-  if (text.endsWith("\n")) all.pop();
-  const lines = all.slice(fileRead.from - 1, Math.min(fileRead.to, all.length));
-  if (!lines.length) return null;
-  if (stdout.replace(/\n$/, "") !== lines.join("\n")) return null;
-  return lines;
+// The file lines the command printed, verified against the file on disk now
+// (so line numbers are trustworthy), or null
+function linesShown(fileRead, output) {
+  const shown = lib.fileLinesShown(fileRead.filePath, fileRead.from, output, { numbers: false });
+  if (!shown) return null;
+  return shown.lines.slice(0, fileRead.to - fileRead.from + 1);
 }
 
 function stdoutOf(toolResponse) {
@@ -138,12 +128,14 @@ function extractOutput(toolResponse) {
   return JSON.stringify(toolResponse);
 }
 
-async function main() {
-  const data = await lib.readStdinJson();
-  if (!data || data.tool_name !== "Bash") process.exit(0);
+// Records a shell command in session memory and returns the note that should
+// replace its output, or null to let the output through. Free plans are
+// measured only.
+function handleBash(data) {
+  if (!data || data.tool_name !== "Bash") return null;
 
   const command = data.tool_input?.command;
-  if (!command) process.exit(0);
+  if (!command) return null;
 
   const cwd = data.cwd || process.cwd();
   const session = lib.loadSession(data.session_id);
@@ -165,26 +157,18 @@ async function main() {
       session.date = lib.today();
       lib.saveSession(data.session_id, session);
       lib.bumpStats({ hits: 1, tokensSaved: cover.savedTokens });
-      if (lib.currentPlanIsPaid()) {
-        process.stdout.write(JSON.stringify({
-          hookSpecificOutput: {
-            hookEventName: "PostToolUse",
-            updatedToolOutput: cover.note,
-          },
-        }));
-      }
-      process.exit(0);
+      return paidOnly(cover.note);
     }
     // Not seen before: the lines are remembered; carry on as a normal command.
   }
 
   const saveIfRemembered = () => { if (lines) lib.saveSession(data.session_id, session); };
-  if (!isReadOnly(command)) { saveIfRemembered(); process.exit(0); }
+  if (!isReadOnly(command)) { saveIfRemembered(); return null; }
 
   const output = extractOutput(data.tool_response);
   if (!output || output.length < MIN_OUTPUT_CHARS || output.length > MAX_OUTPUT_BYTES) {
     saveIfRemembered();
-    process.exit(0);
+    return null;
   }
 
   const normalized = command.trim().replace(/\s+/g, " ");
@@ -206,17 +190,7 @@ async function main() {
     lib.saveSession(data.session_id, session);
     lib.bumpStats({ hits: 1, tokensSaved });
 
-    // Paid plans get the actual benefit: replace the repeated output with a
-    // short note. Free plans are measured only and the output passes through.
-    if (lib.currentPlanIsPaid()) {
-      process.stdout.write(JSON.stringify({
-        hookSpecificOutput: {
-          hookEventName: "PostToolUse",
-          updatedToolOutput: `[Output unchanged since you ran this command earlier this session. ${lineCount} lines. Refer to the earlier output.]`,
-        },
-      }));
-    }
-    process.exit(0);
+    return paidOnly(`[Output unchanged since you ran this command earlier this session. ${lineCount} lines. Refer to the earlier output.]`);
   }
 
   // First run, or output changed — record the hash only (never the output)
@@ -227,8 +201,24 @@ async function main() {
   session.date = lib.today();
   lib.saveSession(data.session_id, session);
   lib.bumpStats({ misses: 1 });
+  return null;
+}
 
+// Paid plans get the actual benefit; free plans are measured only.
+function paidOnly(note) {
+  return lib.currentPlanIsPaid() ? note : null;
+}
+
+async function main() {
+  const note = handleBash(await lib.readStdinJson());
+  if (note) {
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: { hookEventName: "PostToolUse", updatedToolOutput: note },
+    }));
+  }
   process.exit(0);
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { handleBash };
